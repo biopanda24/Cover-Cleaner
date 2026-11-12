@@ -11,7 +11,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from . import defects, descreen, flat, geometry, shading, tone
+from . import defects, descreen, flat, geometry, ml, shading, tone
 from .params import Params
 from .pipeline import Pipeline
 
@@ -19,10 +19,19 @@ Progress = Optional[Callable[[str, float], None]]
 
 
 def auto_params(source: np.ndarray, progress: Progress = None,
-                pipeline: Optional[Pipeline] = None) -> tuple[Params, list[str]]:
+                pipeline: Optional[Pipeline] = None,
+                mode: str = "traditional") -> tuple[Params, list[str]]:
     """Return (Params, human readable report) for a scan."""
     p = Params()
+    p.mode = mode
     report: list[str] = []
+    if mode == "ml" and not ml.available():
+        report.append("ML pipeline selected but the model file is missing "
+                      f"({ml.model_path()}); using traditional repairs.")
+    elif mode == "ml":
+        report.append("Pipeline: ML (neural inpainting for defects inside textured areas).")
+    else:
+        report.append("Pipeline: Traditional.")
     pipe = pipeline or Pipeline(source)
 
     def step(name, frac):

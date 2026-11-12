@@ -12,6 +12,7 @@ import os
 import sys
 import time
 
+from . import ml
 from .auto import auto_params
 from .imageio import SUPPORTED, load_image, save_image
 from .params import Params
@@ -53,6 +54,9 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--save-params", action="store_true",
                    help="write the chosen settings next to each result (.json)")
     a.add_argument("--analyze-only", action="store_true", help="report only, write nothing")
+    a.add_argument("--pipeline", choices=["traditional", "ml"], default=None,
+                   help="ml uses neural inpainting for repairs (default: ml when the model "
+                        "file is present, else traditional)")
 
     b = sub.add_parser("apply", help="apply saved settings (.json) to a scan")
     b.add_argument("input")
@@ -87,7 +91,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             src = load_image(path)
             pipe = Pipeline(src)
-            params, report = auto_params(src, pipeline=pipe)
+            mode = args.pipeline or ("ml" if ml.available() else "traditional")
+            params, report = auto_params(src, pipeline=pipe, mode=mode)
             params.output.scale = args.scale
             for line in report:
                 print("   " + line)

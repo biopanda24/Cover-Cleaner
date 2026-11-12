@@ -110,6 +110,10 @@ class OutputParams:
 
 @dataclass
 class Params:
+    # "traditional": classical image processing only.
+    # "ml": additionally uses neural networks where they do better
+    #        (currently LaMa inpainting for defects inside textured areas).
+    mode: str = "traditional"
     geometry: GeometryParams = field(default_factory=GeometryParams)
     descreen: DescreenParams = field(default_factory=DescreenParams)
     shading: ShadingParams = field(default_factory=ShadingParams)
@@ -131,6 +135,10 @@ class Params:
         p = cls()
         for f in fields(cls):
             sub = getattr(p, f.name)
+            if not is_dataclass(sub):
+                if f.name in d:
+                    setattr(p, f.name, d[f.name])
+                continue
             for k, v in (d.get(f.name) or {}).items():
                 if hasattr(sub, k):
                     setattr(sub, k, v)

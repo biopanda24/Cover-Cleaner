@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 import pytest
 
-from covercleaner import defects, descreen, flat, geometry, shading, tone
+from covercleaner import defects, descreen, flat, geometry, ml, shading, tone
 from covercleaner.auto import auto_params
 from covercleaner.params import Params
 from covercleaner.pipeline import Pipeline
@@ -227,3 +227,35 @@ def test_flat_cleanup_leaves_photos_alone():
     photo = cv2.GaussianBlur(rng.uniform(0, 1, (600, 600, 3)).astype(np.float32), (0, 0), 12)
     photo = (photo - photo.min()) / (photo.max() - photo.min())
     assert flat.find_flat_regions(photo).coverage < 0.05
+
+
+@pytest.mark.skipif(not ml.available(), reason="LaMa model file not downloaded")
+def test_ml_inpainting_beats_diffusion_on_structure_and_matches_on_flat():
+    # structured picture: diagonal stripes with a hole across them
+    y, x = np.mgrid[0:600, 0:600].astype(np.float32)
+    stripes = (np.sin((x + y) / 9.0) > 0).astype(np.float32)
+    img = np.dstack([0.2 + 0.6 * stripes, 0.3 + 0.4 * stripes, 0.8 - 0.5 * stripes])
+    img = cv2.GaussianBlur(img, (0, 0), 1.0).astype(np.float32)
+    mask = np.zeros((600, 600), np.uint8)
+    cv2.circle(mask, (300, 300), 22, 255, -1)
+    sel = mask > 0
+    err_ml = np.abs(ml.inpaint(img, mask) - img)[sel].mean()
+    err_td = np.abs(defects.inpaint(img, mask) - img)[sel].mean()
+    assert err_ml < 0.6 * err_td, (err_ml, err_td)
+    # flat colour: routed to plain diffusion, which is exact
+    flat_img = np.full((300, 300, 3), (0.2, 0.5, 0.9), np.float32)
+    m2 = np.zeros((300, 300), np.uint8)
+    cv2.circle(m2, (150, 150), 10, 255, -1)
+    assert np.abs(ml.inpaint(flat_img, m2) - flat_img).max() < 2e-3
+    # pipeline switch
+    p = Params()
+    pipe = Pipeline(img)
+    pipe.ensure_masks(img.shape)
+    pipe.heal_mask[:] = mask
+    pipe.masks_changed()
+    p.geometry.corners = None
+    a = pipe.run(p, upto="defects")
+    p.mode = "ml"
+    b = pipe.run(p, upto="defects")
+    assert np.abs(b - img)[sel].mean() < np.abs(a - img)[sel].mean()
+    assert Params.from_json(p.to_json()).mode == "ml"

@@ -20,6 +20,7 @@ from . import defects as _defects
 from . import descreen as _descreen
 from . import flat as _flat
 from . import geometry as _geometry
+from . import ml as _ml
 from . import shading as _shading
 from . import tone as _tone
 from .params import Params, stage_key
@@ -39,6 +40,7 @@ class Pipeline:
         self._mask_version = 0
         self.defect_mask: Optional[np.ndarray] = None    # last mask actually used
         self.flat_mask: Optional[np.ndarray] = None      # pixels evened out by 'flat'
+        self._progress: Progress = None
 
     # ---- user masks ------------------------------------------------------
     def masks_changed(self) -> None:
@@ -93,7 +95,11 @@ class Pipeline:
         mask = cv2.bitwise_or(mask, self.heal_mask)
         mask[self.protect_mask > 0] = 0
         self.defect_mask = mask
-        return _defects.inpaint(out, mask) if mask.any() else out
+        if not mask.any():
+            return out
+        if p.mode == "ml" and _ml.available():
+            return _ml.inpaint(out, mask, self._progress)
+        return _defects.inpaint(out, mask)
 
     def _flat(self, img, p: Params):
         f = p.flat
@@ -130,12 +136,15 @@ class Pipeline:
         key = stage_key(getattr(p, name))
         if name in ("defects", "flat"):
             key += f"|masks{self._mask_version}"
+        if name == "defects":
+            key += "|" + (p.mode if _ml.available() else "traditional")
         return key
 
     def run(self, params: Params, upto: str = "output", progress: Progress = None) -> np.ndarray:
         """Run (or reuse) all stages up to and including `upto`."""
         img = self.source
         key = ""
+        self._progress = progress
         last = STAGES.index(upto)
         for i, name in enumerate(STAGES[: last + 1]):
             if name == "defects":

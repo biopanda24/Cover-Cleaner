@@ -26,9 +26,36 @@ Stages run in this order; each works on the output of the one before.
 | Edge shading | darker edges where paper lifted | Median of pixel-to-pixel log differences towards the edge measures the shadow independent of picture content. |
 | Dust / specks | dust, print voids | Small blobs that stand out from a median-filtered copy, sit on a uniform surrounding and are isolated; inpainted. |
 | Glare | reflections on glossy / creased paper | Soft neutral bumps in the darkest channel are subtracted rather than painted over. |
+| Flat colour cleanup | mottled, blotchy or tinted areas that were one solid colour in the artwork | Locally even areas with a consistent colour and artwork-like outlines become regions; matching colours are unified into one palette colour across the cover, near-black / near-white snap to pure values, seams between regions are rebuilt as clean anti-aliased blends, and faint blemishes inside a region are absorbed. |
 | Denoise | paper / scanner grain | Bilateral filter, stronger on colour than on brightness. |
 | Tone | grey blacks, tinted paper white | Ink black and paper white are measured and mapped to 0 / 255. |
 | Sharpen | softness left by the print screen | Unsharp mask on brightness with halo limiting. |
+
+## Traditional and ML pipelines
+
+The **Pipeline** selector in the toolbar (or `--pipeline traditional|ml`)
+switches between:
+
+* **Traditional** - classical image processing only.
+* **ML** - the same pipeline, but dust and Heal-brush repairs inside textured
+  or structured areas are filled by the LaMa inpainting network instead of
+  colour diffusion. Holes surrounded by flat colour still use diffusion,
+  which is exact there.
+
+Measured on these scans by hiding real picture content under artificial
+defects and comparing the fill with the original (mean error, 0-255): city
+photo 11.9 -> 4.3, tape photo 8.1 -> 4.2, leaf collage 6.6 -> 2.6. ML is
+slower: about 2 s per 512 px window on the CPU.
+
+ML needs one model file, `models/inpainting_lama_2025jan.onnx` (92.6 MB,
+Apache-2.0), from OpenCV's model zoo:
+<https://huggingface.co/opencv/inpainting_lama>. It runs with OpenCV's DNN
+module (OpenCV 5), so no other framework is required. Without the file the
+ML option is greyed out and everything falls back to Traditional. ML is the
+default whenever the file is present.
+
+Descreening is traditional in both modes: no descreening network from a
+trustworthy source was found.
 
 ## Auto mode
 
@@ -39,6 +66,11 @@ where a mistake would damage the picture:
 * Dust is removed automatically only on flat colour. Dots inside photos
   (catch lights, reflections) are left alone - raise *Dust sensitivity* above
   0.75 or use the Heal brush.
+* Flat colour cleanup is switched on only when at least half the cover is
+  solid-colour artwork; on photo covers it would posterise even patches.
+  Thin lettering (strokes under about 15 px) is too narrow to be detected
+  as a flat area and is left as scanned. Use the Protect brush to exclude a
+  spot, and *Tolerance* to make it more or less aggressive.
 * Glare is reported but never applied automatically, because soft highlights
   in a photo look the same.
 * Black / white points are only set from neutral ink black and bare paper
@@ -65,6 +97,8 @@ covercleaner/
   descreen.py   halftone analysis and removal
   shading.py    edge shadow correction
   defects.py    dust detection, inpainting, glare
+  flat.py       flat colour cleanup
+  ml.py         LaMa inpainting backend (ML pipeline)
   tone.py       levels, colour, denoise, sharpen, resize
   pipeline.py   staged, cached pipeline
   auto.py       Auto mode analysis
@@ -74,4 +108,4 @@ covercleaner/
 tests/          synthetic ground-truth tests (pytest)
 ```
 
-`Scans/` and `output/` are not tracked by git.
+`Scans/`, `output/` and `models/` are not tracked by git.

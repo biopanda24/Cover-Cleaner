@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
 
 from .. import descreen as _descreen
 from .. import geometry as _geometry
+from .. import ml as _ml
 from ..auto import auto_params
 from ..imageio import SUPPORTED, load_image, save_image
 from ..params import Params
@@ -205,6 +206,20 @@ class MainWindow(QMainWindow):
         act("Open…", self.open_dialog, "Ctrl+O")
         act("Open folder…", self.open_folder_dialog, "Ctrl+Shift+O")
         tb.addSeparator()
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Traditional", "ML"])
+        self.mode_combo.setToolTip(
+            "Traditional: classical image processing only.\n"
+            "ML: also uses a neural network (LaMa) to repair dust and Heal-brush strokes "
+            "inside textured areas - better fills, but slower."
+            + ("" if _ml.available() else "\n\nML model file not found:\n" + _ml.model_path()))
+        if _ml.available():
+            self.mode_combo.setCurrentIndex(1)
+        else:
+            self.mode_combo.model().item(1).setEnabled(False)
+        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
+        tb.addWidget(QLabel(" Pipeline: "))
+        tb.addWidget(self.mode_combo)
         self.act_auto = act("Auto", self.run_auto, "Ctrl+A",
                             "Analyse the scan and choose the best fixes")
         self.act_reset = act("Reset", self.reset_params, None, "Switch every fix off")
@@ -402,6 +417,13 @@ class MainWindow(QMainWindow):
         setattr(getattr(self.params, group), name, value)
         self.request_render()
 
+    def _mode(self) -> str:
+        return "ml" if self.mode_combo.currentIndex() == 1 else "traditional"
+
+    def _mode_changed(self, *_):
+        self.params.mode = self._mode()
+        self.request_render()
+
     def _group_toggled(self, group: str, on: bool):
         if group == "descreen" and on and not self.params.descreen.peaks:
             self.params.descreen.enabled = True
@@ -493,6 +515,7 @@ class MainWindow(QMainWindow):
         self.path = path
         self.pipe = Pipeline(self.source)
         self.params = Params()
+        self.params.mode = self._mode()
         self.result = None
         self.report.setPlainText("")
         self.setWindowTitle(f"Cover Cleaner - {os.path.basename(path)}")
@@ -540,10 +563,10 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(300, self.run_auto)
             return
         self.busy = True
-        src, pipe, path = self.source, self.pipe, self.path
+        src, pipe, path, mode = self.source, self.pipe, self.path, self._mode()
 
         def work(progress):
-            return path, auto_params(src, progress, pipe)
+            return path, auto_params(src, progress, pipe, mode)
 
         def done(res):
             self.busy = False
@@ -792,6 +815,7 @@ class MainWindow(QMainWindow):
     # ---- settings / saving -----------------------------------------------
     def reset_params(self):
         self.params = Params()
+        self.params.mode = self._mode()
         if self.pipe:
             self.pipe.clear_masks()
         self.report.setPlainText("All fixes switched off.")
@@ -814,6 +838,11 @@ class MainWindow(QMainWindow):
         try:
             with open(path, encoding="utf8") as fh:
                 self.params = Params.from_json(fh.read())
+            if self.params.mode == "ml" and not _ml.available():
+                self.params.mode = "traditional"
+            self.mode_combo.blockSignals(True)
+            self.mode_combo.setCurrentIndex(1 if self.params.mode == "ml" else 0)
+            self.mode_combo.blockSignals(False)
         except Exception as exc:
             QMessageBox.warning(self, "Cover Cleaner", f"Could not read settings:\n{exc}")
             return
@@ -848,7 +877,7 @@ class MainWindow(QMainWindow):
             return
         if os.path.normcase(os.path.abspath(out)) == os.path.normcase(os.path.abspath(self.folder)):
             out = os.path.join(out, "restored")   # never overwrite the scans
-        folder, bits = self.folder, int(self.bits.currentText())
+        folder, bits, mode = self.folder, int(self.bits.currentText()), self._mode()
         self.busy = True
 
         def work(progress):
@@ -858,7 +887,7 @@ class MainWindow(QMainWindow):
                 try:
                     src = load_image(os.path.join(folder, name))
                     pipe = Pipeline(src)
-                    params, report = auto_params(src, None, pipe)
+                    params, report = auto_params(src, None, pipe, mode)
                     dst = os.path.join(out, os.path.splitext(name)[0] + ".png")
                     save_image(dst, pipe.run(params), bits)
                     with open(os.path.splitext(dst)[0] + ".json", "w", encoding="utf8") as fh:
