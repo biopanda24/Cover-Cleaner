@@ -21,7 +21,7 @@ Stages run in this order; each works on the output of the one before.
 
 | Stage | Problem | Method |
 |---|---|---|
-| Crop / deskew / flatten | scanner background, crooked scan, curved edges | Background colour from the image border, then each paper edge is located at full resolution (outermost sharp transition, stepping over the lid shadow) and fitted with a robust line or gentle curve. A Coons-patch remap maps the outline to a rectangle. |
+| Crop / deskew / flatten | scanner background, crooked scan, curved edges, unevenly lit lid | Background colour modelled per side from the image border (a lid that is darker along one side, e.g. lifted by a booklet spine, is not mistaken for cover), then each paper edge is located at full resolution (outermost sharp transition, stepping over the lid shadow) and fitted with a robust line or gentle curve. A Coons-patch remap maps the outline to a rectangle. |
 | Descreen | halftone dot pattern, rosette/moire | The averaged power spectrum reveals the screen frequencies; those are notched out, plus a low-pass just below the screen frequency. Solid lettering falls back to notch-only so it stays crisp. |
 | Edge shading | darker edges where paper lifted | Median of pixel-to-pixel log differences towards the edge measures the shadow independent of picture content. |
 | Dust / specks | dust, print voids | Small blobs that stand out from a median-filtered copy, sit on a uniform surrounding and are isolated; inpainted. |
@@ -75,8 +75,13 @@ where a mistake would damage the picture:
   in a photo look the same.
 * Black / white points are only set from neutral ink black and bare paper
   white, so coloured covers keep their palette.
+* If an edge is not found near the rough outline, it is searched for up to
+  15% of the side further inward, and accepted only when it is a strong
+  straight edge with nothing but plain lid outside it (no print texture).
 * A paper edge that is white on a white scanner lid with no shadow cannot be
   seen; the report flags it so the corner can be dragged by hand.
+* Worn or discoloured paper along an edge (e.g. a whitened spine fold) is
+  kept; use the Trim boxes to cut it off.
 
 ## Manual control
 

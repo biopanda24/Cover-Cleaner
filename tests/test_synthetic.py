@@ -32,13 +32,18 @@ def make_cover(size=900, seed=0):
     return np.clip(img, 0, 1)
 
 
-def place_on_scanner(cover, angle=1.7, margin=140, shadow=True):
-    """Rotate the cover and put it on a white scanner lid with a soft shadow."""
+def place_on_scanner(cover, angle=1.7, margin=140, shadow=True, lid_gain=None):
+    """Rotate the cover and put it on a white scanner lid with a soft shadow.
+
+    `lid_gain` (H x W) darkens parts of the lid, e.g. where it did not lie flat.
+    """
     h, w = cover.shape[:2]
     H, W = h + 2 * margin, w + 2 * margin
     m = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
     m[:, 2] += margin
     canvas = np.full((H, W, 3), 0.975, np.float32)
+    if lid_gain is not None:
+        canvas *= lid_gain[:, :, None]
     alpha = cv2.warpAffine(np.ones((h, w), np.float32), m, (W, H), flags=cv2.INTER_LINEAR)
     warped = cv2.warpAffine(cover, m, (W, H), flags=cv2.INTER_CUBIC)
     if shadow:
@@ -97,6 +102,56 @@ def test_curved_edge_is_straightened():
     det = geometry.detect_cover(bent)
     assert 3.5 < det.max_bow < 9, det.max_bow
     assert np.abs(det.bow[0]).max() == pytest.approx(det.max_bow)
+
+
+def _dark_left_lid(H, W, width=140):
+    """Lid gain for a scan whose lid is darker along the left side (as in 4.png):
+    about 4% darker at the image edge, 6% next to the cover, darkest mid-height."""
+    y, x = np.mgrid[0:H, 0:W].astype(np.float32)
+    depth = (0.035 + 0.02 * np.clip(x / width, 0, 1)) * (0.6 + 0.4 * np.sin(np.pi * y / H))
+    depth[x > width] = 0
+    return cv2.GaussianBlur(1.0 - depth, (0, 0), 6)
+
+
+def test_darker_lid_strip_is_not_mistaken_for_cover():
+    cover = make_cover()
+    H = W = 900 + 2 * 140
+    scan, truth = place_on_scanner(cover, angle=0.6, shadow=False, lid_gain=_dark_left_lid(H, W))
+    det = geometry.detect_cover(scan)
+    err = np.abs(det.corners - truth).max()
+    assert err < 2.5, f"corner error {err:.2f}px, corners {np.round(det.corners, 1).tolist()}"
+
+
+def test_edge_far_inside_rough_outline_is_found(monkeypatch):
+    """If the rough pass is off by more than the normal search band, the
+    wider inward search still finds the paper edge."""
+    scan, truth = place_on_scanner(make_cover(), angle=0.0, shadow=False)
+    real = geometry._coarse_rect
+
+    def too_wide(img, det):
+        box = real(img, det)
+        box[0, 0] -= 100            # left side 100 px out into the lid
+        box[3, 0] -= 100
+        return box
+
+    monkeypatch.setattr(geometry, "_coarse_rect", too_wide)
+    det = geometry.detect_cover(scan)
+    err = np.abs(det.corners - truth).max()
+    assert err < 2.5, f"corner error {err:.2f}px"
+    assert any("inside the rough outline" in n for n in det.notes)
+
+
+def test_cover_cut_by_image_border_is_not_cropped_into():
+    """A cover running off the image on one side must keep that side at the
+    image border, not jump to some edge inside the picture."""
+    cover = np.ascontiguousarray(make_cover()[:450])   # wide, short (VHS-like)
+    scan, truth = place_on_scanner(cover, angle=0.0, shadow=False)
+    cut = np.ascontiguousarray(scan[:, 200:])          # cover now starts before x = 0
+    det = geometry.detect_cover(cut)
+    assert det.has_background
+    assert max(det.corners[0, 0], det.corners[3, 0]) < 4, np.round(det.corners, 1).tolist()
+    assert np.abs(det.corners[1:3] - (truth[1:3] - [200, 0])).max() < 2.5
+    assert not any("inside the rough outline" in n for n in det.notes)
 
 
 def test_screen_detection_and_descreen():

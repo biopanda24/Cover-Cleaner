@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+from scipy.ndimage import median_filter
 
 from .imageio import luminance
 
@@ -85,6 +86,45 @@ def _side_frame(a, b, center):
 # coarse pass
 # --------------------------------------------------------------------------
 
+def _background_model(small: np.ndarray, m: int):
+    """Per-pixel estimate of the scanner background (lid) colour.
+
+    The lid is not always evenly lit: where it does not lie flat, e.g. lifted
+    by a booklet's spine, a whole side of the scan can be several levels
+    darker than the rest.  Each image border gives a colour profile along
+    that side (median filtered, so dust and small objects drop out); inside
+    the image the four profiles are blended by inverse squared distance, so
+    every pixel is compared with the lid colour of its nearest side.
+
+    Returns (global background colour, model image).
+    """
+    sh, sw = small.shape[:2]
+    strips = [small[:m], small[-m:], small[:, :m], small[:, -m:]]
+    glob = np.median(np.concatenate([s.reshape(-1, 3) for s in strips]), axis=0)
+
+    def profile(values: np.ndarray, length: int) -> np.ndarray:
+        k = max(3, int(0.08 * length) | 1)
+        prof = median_filter(values, size=(k, 1), mode="nearest")
+        # Far from the overall lid colour = the cover itself reaches the
+        # image edge here; fall back to the overall colour.
+        far = np.abs(prof - glob).max(axis=1) > 0.10
+        prof[far] = glob
+        return prof.astype(np.float32)
+
+    top = profile(np.median(small[:m], axis=0), sw)          # (sw, 3)
+    bottom = profile(np.median(small[-m:], axis=0), sw)
+    left = profile(np.median(small[:, :m], axis=1), sh)      # (sh, 3)
+    right = profile(np.median(small[:, -m:], axis=1), sh)
+    y = np.arange(sh, dtype=np.float32)[:, None] + 1.0
+    x = np.arange(sw, dtype=np.float32)[None, :] + 1.0
+    wt, wb = 1.0 / y ** 2, 1.0 / (sh + 1.0 - y) ** 2           # (sh, 1)
+    wl, wr = 1.0 / x ** 2, 1.0 / (sw + 1.0 - x) ** 2           # (1, sw)
+    model = (wt[..., None] * top[None] + wb[..., None] * bottom[None]
+             + wl[..., None] * left[:, None] + wr[..., None] * right[:, None])
+    model /= (wt + wb + wl + wr)[..., None]
+    return glob, model
+
+
 def _coarse_rect(img: np.ndarray, det: CoverDetection):
     h, w = img.shape[:2]
     scale = 900.0 / max(h, w)
@@ -92,19 +132,21 @@ def _coarse_rect(img: np.ndarray, det: CoverDetection):
     small = cv2.GaussianBlur(small, (0, 0), 1.0)
     sh, sw = small.shape[:2]
     m = max(3, int(round(0.012 * max(sh, sw))))
-    border = np.concatenate([
-        small[:m].reshape(-1, 3), small[-m:].reshape(-1, 3),
-        small[:, :m].reshape(-1, 3), small[:, -m:].reshape(-1, 3)])
-    bg = np.median(border, axis=0)
-    bdist = np.abs(border - bg).max(axis=1)
-    det.bg_color = tuple(float(x) for x in bg)
+    glob, model = _background_model(small, m)
+    det.bg_color = tuple(float(x) for x in glob)
+    dist = np.abs(small - model).max(axis=2)
+    bdist = np.concatenate([dist[:m].ravel(), dist[-m:].ravel(),
+                            dist[:, :m].ravel(), dist[:, -m:].ravel()])
     if np.percentile(bdist, 85) > 0.10:
         det.notes.append("Image border is not a uniform scanner background; "
                          "assuming the scan is already cropped.")
         return None
+    if float(np.abs(model - glob).max()) > 0.035:
+        det.notes.append("Scanner lid is unevenly lit (darker along one side); "
+                         "compensated.")
     mad = float(np.median(bdist))
     thr = max(0.045, 8.0 * mad)
-    mask = (np.abs(small - bg).max(axis=2) > thr).astype(np.uint8)
+    mask = (dist > thr).astype(np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     min_area = max(40, int(0.0004 * sh * sw))
@@ -131,14 +173,14 @@ def _coarse_rect(img: np.ndarray, det: CoverDetection):
 # fine pass
 # --------------------------------------------------------------------------
 
-def _sample_band(img_blur, a, t, n, length, radius, step=2.0, margin=0.03):
+def _sample_band(img_blur, a, t, n, length, radius, step=2.0, margin=0.03, inner=None):
     """Resample a band around side a->(a+t*length).
 
     Rows = positions along the side, columns = offsets from +radius
-    (outside) to -radius (inside) in 1 px steps.
+    (outside) to -inner (inside, default -radius) in 1 px steps.
     """
     s = np.arange(length * margin, length * (1 - margin), step)
-    o = np.arange(radius, -radius - 1, -1.0)
+    o = np.arange(radius, -(radius if inner is None else inner) - 1, -1.0)
     px = a[0] + np.outer(s, np.full_like(o, t[0])) + np.outer(np.ones_like(s), o * n[0])
     py = a[1] + np.outer(s, np.full_like(o, t[1])) + np.outer(np.ones_like(s), o * n[1])
     band = cv2.remap(img_blur, px.astype(np.float32), py.astype(np.float32),
@@ -259,7 +301,8 @@ def _fit_side(s, e):
     outside = (e1 - np.polyval(coef, s1)) > 3.0
     if outside.sum() >= max(10, 0.18 * len(e1)):
         fit2 = _ransac_poly(s1[outside], e1[outside], 1)
-        if fit2 is not None and fit2[1].sum() >= 0.6 * outside.sum()                 and (np.ptp(s1[outside][fit2[1]]) > 0.4 * np.ptp(s1)):
+        if fit2 is not None and fit2[1].sum() >= 0.6 * outside.sum() \
+                and np.ptp(s1[outside][fit2[1]]) > 0.4 * np.ptp(s1):
             coef = fit2[0]
             inl = np.abs(e1 - np.polyval(coef, s1)) < 1.5
     # Paper that is not flat has gently curved edges: accept a parabola
@@ -274,6 +317,29 @@ def _fit_side(s, e):
     mask = np.zeros(len(e), bool)
     mask[np.flatnonzero(ok)[inl]] = True
     return coef, float(inl.sum()) / len(e), mask
+
+
+LID_TEXTURE = 0.004     # high-frequency level: bare lid < ~0.0025, print > ~0.005
+
+
+def _on_image_border(a, b, w, h, tol=4.0) -> bool:
+    """True when side a-b runs along one of the image borders."""
+    return (max(a[0], b[0]) < tol or min(a[0], b[0]) > w - 1 - tol
+            or max(a[1], b[1]) < tol or min(a[1], b[1]) > h - 1 - tol)
+
+
+def _cut_looks_like_lid(band, o, s, coef, lid_colour) -> bool:
+    """Is everything between the rough line (offset 0) and a newly found edge
+    further inside plain scanner lid?  Printed picture has halftone or
+    colour; the lid is smooth and close to the background colour."""
+    edge = np.polyval(coef, s)[:, None]
+    region = (o[None, :] <= 0) & (o[None, :] > edge + 6)
+    if region.sum() < 50:
+        return True
+    hp = np.abs(band - cv2.GaussianBlur(band, (0, 0), 2.0)).max(axis=2)
+    texture = float(hp[region].mean())
+    colour = np.median(band[region], axis=0)
+    return texture < LID_TEXTURE and float(np.abs(colour - lid_colour).max()) < 0.12
 
 
 def _robust_poly(x, y, basis, iters=6, scale=1.0):
@@ -308,6 +374,7 @@ def detect_cover(img: np.ndarray, fit_bow: bool = True) -> CoverDetection:
     found = [False] * 4
     conf = [0.0] * 4
     samples = [np.zeros((0, 2))] * 4
+    lid = np.asarray(det.bg_color, np.float32)
     for _pass in range(2):
         center = corners.mean(axis=0)
         starts, ends = [], []       # tangent lines of each side at its two ends
@@ -317,6 +384,25 @@ def detect_cover(img: np.ndarray, fit_bow: bool = True) -> CoverDetection:
             s, o, band = _sample_band(img_blur, a, t, n, length, radius)
             e = _pick_edges(band, o)
             fit = _fit_side(s, e)
+            suspicious = fit is None or fit[1] < 0.3 or _on_image_border(a, b, w, h)
+            if _pass == 0 and suspicious:
+                # The rough outline may be far outside the paper (lid
+                # differences counted as cover).  Look much further inward,
+                # but accept only a strong straight edge with nothing but
+                # plain lid between it and the rough line.
+                inner = int(min(0.15 * length, 600))
+                s2, o2, band2 = _sample_band(img_blur, a, t, n, length, radius, inner=inner)
+                e2 = _pick_edges(band2, o2)
+                fit2 = _fit_side(s2, e2)
+                if fit2 is not None and fit2[1] >= 0.6 \
+                        and (fit is None or fit2[1] >= fit[1] + 0.15):
+                    move = float(np.polyval(fit2[0], length / 2))
+                    if move < -0.5 * radius \
+                            and _cut_looks_like_lid(band2, o2, s2, fit2[0], lid):
+                        s, o, band, e, fit = s2, o2, band2, e2, fit2
+                        det.notes.append(
+                            f"{SIDE_NAMES[i]} edge found {-move:.0f} px inside the rough "
+                            "outline (uneven scanner lid).")
             if fit is None:
                 starts.append((a, t))
                 ends.append((a, t))
