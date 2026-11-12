@@ -11,7 +11,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from . import defects, descreen, flat, geometry, ml, shading, tone
+from . import defects, descreen, flat, geometry, ml, ocr, shading, tone
 from .params import Params
 from .pipeline import Pipeline
 
@@ -66,17 +66,33 @@ def auto_params(source: np.ndarray, progress: Progress = None,
         report.append("  " + note)
     img = pipe.run(p, upto="geometry")
     if g.disc:
-        # A disc has no edges to straighten: level its straight text instead.
+        # A disc has no edges to straighten: level its straight text instead,
+        # then read the text to find which way up it goes.
         ang, strength = geometry.text_angle(img, disc=True)
         if strength >= 1.6 and abs(ang) >= 0.3:
             g.angle = round(ang, 2)
-            report.append(f"Disc: rotated {g.angle:+.1f} deg so its straight text is level. "
-                          "Whether it is upright cannot be judged automatically; use the "
-                          "rotate buttons if it is sideways or upside down.")
+            report.append(f"Disc: rotated {g.angle:+.1f} deg so its straight text is level.")
             img = pipe.run(p, upto="geometry")
         else:
-            report.append("Disc: no clear straight text to level it by; rotation left "
-                          "as scanned.")
+            report.append("Disc: no clear straight text to level it by; angle left as scanned.")
+        if ocr.available():
+            step("Reading the disc's text", 0.1)
+            turns, margin, scores = ocr.upright_turns(img)
+            if turns is not None and scores[turns][0] >= 8 and margin >= 2.0:
+                if turns:
+                    g.rotate90 = (g.rotate90 - turns) % 4
+                    img = pipe.run(p, upto="geometry")
+                    report.append(f"  Turned {turns * 90} deg counter-clockwise: its text reads "
+                                  f"upright that way ({int(scores[turns][0])} characters read "
+                                  "confidently).")
+                else:
+                    report.append("  Already upright: its text reads that way.")
+            else:
+                report.append("  Could not tell which way up it goes from its text; use the "
+                              "rotate buttons if needed.")
+        else:
+            report.append("  Which way up it goes is not checked (text models not installed); "
+                          "use the rotate buttons if needed.")
 
     # ---- 2. halftone screen ----------------------------------------------
     step("Analysing print screen", 0.2)

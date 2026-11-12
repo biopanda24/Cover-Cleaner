@@ -673,6 +673,8 @@ def detect_cover(img: np.ndarray, fit_bow: bool = True, dpi: float | None = None
     img_blur = cv2.GaussianBlur(img, (0, 0), 1.0)
     if det.disc is not None:
         cx, cy, r, conf = _refine_disc(img_blur, *det.disc)
+        # a second round from the better centre: rays then cross the rim squarely
+        cx, cy, r, conf = _refine_disc(img_blur, cx, cy, r)
         if dpi:
             # discs are 120 mm (CD/DVD) or 80 mm (mini CD) across; a round
             # picture printed on a white cover is not a disc

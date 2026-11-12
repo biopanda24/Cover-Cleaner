@@ -57,6 +57,17 @@ default whenever the file is present.
 Descreening is traditional in both modes: no descreening network from a
 trustworthy source was found.
 
+Discs are turned upright with two more models from OpenCV's model zoo
+(Apache-2.0), used in both pipelines when present in `models/`:
+`text_detection_en_ppocrv3_2023may.onnx` (2.4 MB, from
+<https://huggingface.co/opencv/text_detection_ppocr>) finds lines of text and
+`text_recognition_CRNN_CH_2021sep.onnx` (65 MB, from
+<https://huggingface.co/opencv/text_recognition_crnn>) reads them. The
+quarter turn at which the most characters read with 80 % confidence wins,
+if it has at least 8 such characters and twice as many as any other turn.
+The recogniser reads Latin letters, digits and symbols; a disc with only
+Japanese text is left as it is.
+
 ## Auto mode
 
 Auto analyses the scan and only switches a fix on when it finds evidence for
@@ -89,8 +100,10 @@ where a mistake would damage the picture:
 * A cover running past one or two edges of the scan keeps those edges.
 * Discs (CD/DVD, recognised by shape and 120/80 mm size) are cropped square,
   everything outside the disc becomes white, and the disc is turned so its
-  straight text is level. Whether it is upright is not judged; use the
+  straight text is level. It is then turned upright by reading its text at
+  all four quarter turns (see below); without the text models, use the
   rotate buttons. *Fine rotate* in the editor adjusts any cover by degrees.
+  Covers are not turned this way: many have deliberately sideways titles.
 * A paper edge that is white on a white scanner lid with no shadow cannot be
   seen; the report flags it so the corner can be dragged by hand.
 * Worn or discoloured paper along an edge (a whitened spine fold, the white
@@ -122,6 +135,7 @@ covercleaner/
   defects.py    dust detection, inpainting, glare
   flat.py       flat colour cleanup
   ml.py         LaMa inpainting backend (ML pipeline)
+  ocr.py        text detection/recognition: which way up a disc goes
   tone.py       levels, colour, denoise, sharpen, resize
   pipeline.py   staged, cached pipeline
   auto.py       Auto mode analysis

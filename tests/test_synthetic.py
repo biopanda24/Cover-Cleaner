@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 import pytest
 
-from covercleaner import defects, descreen, flat, geometry, ml, shading, tone
+from covercleaner import defects, descreen, flat, geometry, ml, ocr, shading, tone
 from covercleaner.auto import auto_params
 from covercleaner.params import Params
 from covercleaner.pipeline import Pipeline
@@ -194,6 +194,16 @@ def test_text_angle_levels_straight_text():
         assert abs(ang + true) < 0.5 and strength > 1.6, (true, ang, strength)
         level = geometry.apply_geometry(rot, None, angle=ang)
         assert abs(geometry.text_angle(level)[0]) < 0.5
+
+
+@pytest.mark.skipif(not ocr.available(), reason="text models not downloaded")
+def test_upright_turn_is_found_from_text():
+    img = np.full((900, 900, 3), 0.95, np.float32)
+    for k, word in enumerate(("Crescent", "May 2009", "ANGCD-000", "Limited article")):
+        _text(img, word, (120, 220 + 140 * k), 2.0, 0.1, 4)
+    for k in range(4):
+        turns, margin, scores = ocr.upright_turns(np.ascontiguousarray(np.rot90(img, k)))
+        assert turns == (4 - k) % 4 and margin >= 2.0, (k, turns, scores)
 
 
 def test_cover_running_off_the_scan_keeps_that_edge():
