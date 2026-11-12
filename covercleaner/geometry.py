@@ -196,54 +196,84 @@ def _pick_edges(band: np.ndarray, o: np.ndarray):
     return out
 
 
-def _ransac_line(s, e, tol=1.5, iters=400, rng=None):
-    """Robust line e = k*s + c. Returns (k, c, inlier_mask)."""
-    rng = rng or np.random.default_rng(0)
+def _ransac_poly(s, e, deg=1, tol=1.5, iters=400, max_sag=0.0):
+    """Robust polynomial e(s) of degree 1 or 2.
+
+    Returns (coefficients [a, b, c] of a*s^2 + b*s + c, inlier mask) or None.
+    """
+    rng = np.random.default_rng(0)
     n = len(s)
-    best = None
-    best_cnt = -1
+    if n < deg + 1:
+        return None
+    span = float(np.ptp(s)) + 1e-9
+    mid = float(s.min()) + span / 2
+    best, best_cnt = None, -1
     for _ in range(iters):
-        i, j = rng.integers(0, n, 2)
-        if abs(s[i] - s[j]) < 0.15 * (s.max() - s.min() + 1e-9):
+        idx = rng.integers(0, n, deg + 1)
+        ss = np.sort(s[idx])
+        if np.diff(ss).min() < 0.15 * span / deg:
             continue
-        k = (e[j] - e[i]) / (s[j] - s[i])
-        if abs(k) > 0.08:
+        coef = np.polyfit(s[idx], e[idx], deg)
+        if deg == 2:
+            if abs(coef[0]) * span * span / 4 > max_sag:
+                continue
+            slope = 2 * coef[0] * mid + coef[1]
+        else:
+            slope = coef[0]
+        if abs(slope) > 0.08:
             continue
-        c = e[i] - k * s[i]
-        inl = np.abs(e - (k * s + c)) < tol
+        inl = np.abs(e - np.polyval(coef, s)) < tol
         cnt = int(inl.sum())
         if cnt > best_cnt:
             best_cnt, best = cnt, inl
-    if best is None or best_cnt < 2:
+    if best is None or best_cnt < deg + 2:
         return None
-    k, c = np.polyfit(s[best], e[best], 1)
-    inl = np.abs(e - (k * s + c)) < tol
-    if inl.sum() >= 2:
-        k, c = np.polyfit(s[inl], e[inl], 1)
-    return float(k), float(c), inl
+    inl = best
+    for _ in range(2):
+        coef = np.polyfit(s[inl], e[inl], deg)
+        new = np.abs(e - np.polyval(coef, s)) < tol
+        if new.sum() < deg + 2:
+            break
+        inl = new
+    full = np.zeros(3)
+    full[3 - len(coef):] = coef
+    return full, inl
 
 
-def _fit_side_line(s, e):
-    """Fit the paper-edge line, preferring the outermost consistent line."""
+def _fit_side(s, e):
+    """Fit the paper edge e(s): a line, or a gentle curve if the paper bows.
+
+    Prefers the outermost consistent line.  Returns (coef, confidence,
+    inlier mask over all samples) or None.
+    """
     ok = np.isfinite(e)
     if ok.sum() < max(12, 0.10 * len(e)):
         return None
     s1, e1 = s[ok], e[ok]
-    fit = _ransac_line(s1, e1)
+    fit = _ransac_poly(s1, e1, 1)
     if fit is None:
         return None
-    k, c, inl = fit
+    coef, inl = fit
     # Points clearly outside the dominant line may be the real paper edge
     # (the dominant line being a printed frame just inside it).
-    outside = (e1 - (k * s1 + c)) > 3.0
+    outside = (e1 - np.polyval(coef, s1)) > 3.0
     if outside.sum() >= max(10, 0.18 * len(e1)):
-        fit2 = _ransac_line(s1[outside], e1[outside])
-        if fit2 is not None and fit2[2].sum() >= 0.6 * outside.sum() \
-                and (np.ptp(s1[outside][fit2[2]]) > 0.4 * np.ptp(s1)):
-            k, c = fit2[0], fit2[1]
-            inl = np.abs(e1 - (k * s1 + c)) < 1.5
-    frac = float(inl.sum()) / len(e)
-    return k, c, frac
+        fit2 = _ransac_poly(s1[outside], e1[outside], 1)
+        if fit2 is not None and fit2[1].sum() >= 0.6 * outside.sum()                 and (np.ptp(s1[outside][fit2[1]]) > 0.4 * np.ptp(s1)):
+            coef = fit2[0]
+            inl = np.abs(e1 - np.polyval(coef, s1)) < 1.5
+    # Paper that is not flat has gently curved edges: accept a parabola
+    # when it explains clearly more of the edge than the straight line.
+    span = float(np.ptp(s1))
+    band = np.abs(e1 - np.polyval(coef, s1)) < max(8.0, 0.012 * span)
+    if band.sum() >= 30:
+        quad = _ransac_poly(s1[band], e1[band], 2, max_sag=0.012 * span)
+        if quad is not None and quad[1].sum() > 1.15 * inl.sum() + 5:
+            coef = quad[0]
+            inl = np.abs(e1 - np.polyval(coef, s1)) < 1.5
+    mask = np.zeros(len(e), bool)
+    mask[np.flatnonzero(ok)[inl]] = True
+    return coef, float(inl.sum()) / len(e), mask
 
 
 def _robust_poly(x, y, basis, iters=6, scale=1.0):
@@ -280,29 +310,30 @@ def detect_cover(img: np.ndarray, fit_bow: bool = True) -> CoverDetection:
     samples = [np.zeros((0, 2))] * 4
     for _pass in range(2):
         center = corners.mean(axis=0)
-        lines = []
+        starts, ends = [], []       # tangent lines of each side at its two ends
         for i in range(4):
             a, b = corners[i], corners[(i + 1) % 4]
             t, n, length = _side_frame(a, b, center)
             s, o, band = _sample_band(img_blur, a, t, n, length, radius)
             e = _pick_edges(band, o)
-            fit = _fit_side_line(s, e)
+            fit = _fit_side(s, e)
             if fit is None:
-                lines.append((a, t))
+                starts.append((a, t))
+                ends.append((a, t))
                 if _pass == 1 and not found[i]:
                     det.notes.append(f"{SIDE_NAMES[i]} edge not visible against the "
                                      "background; using a rough estimate.")
                 continue
-            k, c, frac = fit
-            d = t + n * k
-            lines.append((a + n * c, d / np.hypot(*d)))
-            ok = np.isfinite(e)
-            samples[i] = a + np.outer(s[ok], t) + np.outer(e[ok], n)
+            coef, frac, inl = fit
+            for sv, store in ((0.0, starts), (length, ends)):
+                d = t + n * np.polyval(np.polyder(coef), sv)
+                store.append((a + t * sv + n * np.polyval(coef, sv), d / np.hypot(*d)))
+            samples[i] = a + np.outer(s[inl], t) + np.outer(e[inl], n)
             conf[i] = frac
             found[i] = True
         new = np.zeros((4, 2))
         for i in range(4):
-            p = _intersect(*lines[i - 1], *lines[i])
+            p = _intersect(*ends[i - 1], *starts[i])
             new[i] = corners[i] if p is None else p
         corners = new
     center = corners.mean(axis=0)
@@ -320,7 +351,7 @@ def detect_cover(img: np.ndarray, fit_bow: bool = True) -> CoverDetection:
             continue
         u = (pts - a) @ t / length
         r = (pts - a) @ n
-        near = np.abs(r) < 5.0
+        near = np.abs(r) < 0.02 * length
         u, r = u[near], r[near]
         covered = len(u) and (np.histogram(u, bins=8, range=(0, 1))[0] > 3).sum() >= 7
         if fit_bow and conf[i] >= 0.5 and covered:

@@ -70,7 +70,10 @@ def analyze_screen(img: np.ndarray, min_ratio: float = 60.0) -> ScreenAnalysis:
             sel = acc[ri == k]
             if sel.size:
                 rad[k] = np.median(sel)
-        ratio = np.maximum(ratio, acc / np.maximum(rad[ri], 1e-20))
+        # Floor = spectrum of faint white noise (sigma 0.5/255), so a clean,
+        # noise-free image cannot produce huge ratios out of nothing.
+        floor = (0.002 ** 2) * (0.375 * TILE) ** 2
+        ratio = np.maximum(ratio, acc / np.maximum(rad[ri], floor))
     # Ignore low frequencies (picture content) and the axes, where sharp
     # horizontal/vertical picture edges and scanner streaks concentrate.
     ratio[r < 0.07] = 0
@@ -83,11 +86,23 @@ def analyze_screen(img: np.ndarray, min_ratio: float = 60.0) -> ScreenAnalysis:
     fxs = sfft.fftshift(fx)[ys, xs]
     fys = sfft.fftshift(fy)[ys, xs]
     vals = shifted[ys, xs]
-    if vals.size == 0 or vals.max() < min_ratio:
+    # Presence test uses off-axis peaks only: sharp horizontal / vertical
+    # picture edges put energy on the axes at every frequency.
+    rr = np.hypot(fxs, fys)
+    off_axis = (np.abs(fxs) > 2.5 / TILE) & (np.abs(fys) > 2.5 / TILE)
+    if not off_axis.any() or vals[off_axis].max() < min_ratio:
+        return res
+    top = float(vals[off_axis].max())
+    # A dot grid is periodic in two perpendicular directions, so the main
+    # peak must have a partner rotated by 90 degrees.
+    j = int(np.flatnonzero(off_axis)[np.argmax(vals[off_axis])])
+    py = int(round(fxs[j] * TILE)) % TILE
+    px = int(round(-fys[j] * TILE)) % TILE
+    win = ratio[np.ix_(np.arange(py - 2, py + 3) % TILE, np.arange(px - 2, px + 3) % TILE)]
+    if win.max() < 0.03 * top:
         return res
     # Fundamental = lowest frequency among the really strong peaks.
-    rr = np.hypot(fxs, fys)
-    strong = vals >= max(min_ratio, 0.2 * vals.max())
+    strong = off_axis & (vals >= max(min_ratio, 0.2 * top))
     f0 = float(rr[strong].min())
     if not 0.10 <= f0 <= 0.49:
         return res
@@ -102,7 +117,7 @@ def analyze_screen(img: np.ndarray, min_ratio: float = 60.0) -> ScreenAnalysis:
     res.found = True
     res.frequency = f0
     res.period = 1.0 / f0
-    res.strength = float(vals.max())
+    res.strength = top
     res.peaks = peaks
     res.lpi_at_600dpi = 600.0 * f0
     return res
