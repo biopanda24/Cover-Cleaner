@@ -75,9 +75,22 @@ where a mistake would damage the picture:
   in a photo look the same.
 * Black / white points are only set from neutral ink black and bare paper
   white, so coloured covers keep their palette.
+* A paper edge is the outermost *sharp* transition: soft lid shadows and a
+  lid lifted by a booklet spine (a gradient up to ~1000 px wide) are
+  stepped over, as is a smooth, neutral shadow line just outside the paper.
 * If an edge is not found near the rough outline, it is searched for up to
-  15% of the side further inward, and accepted only when it is a strong
+  45% of the side further inward, and accepted only when it is a strong
   straight edge with nothing but plain lid outside it (no print texture).
+  A side without a trustworthy edge is kept parallel/perpendicular to the
+  reliable sides (a cover is a rectangle).
+* Edges that cannot be seen at all (white cover on a white lid) are placed
+  from the CD booklet size, 120 mm, using the DPI stored in the scan. The
+  report says when this happened.
+* A cover running past one or two edges of the scan keeps those edges.
+* Discs (CD/DVD, recognised by shape and 120/80 mm size) are cropped square,
+  everything outside the disc becomes white, and the disc is turned so its
+  straight text is level. Whether it is upright is not judged; use the
+  rotate buttons. *Fine rotate* in the editor adjusts any cover by degrees.
 * A paper edge that is white on a white scanner lid with no shadow cannot be
   seen; the report flags it so the corner can be dragged by hand.
 * Worn or discoloured paper along an edge (a whitened spine fold, the white
@@ -116,6 +129,9 @@ covercleaner/
   cli.py        command line / batch
   gui/          PySide6 editor
 tests/          synthetic ground-truth tests (pytest)
+tools/          batch_eval.py (Auto on a folder, in parallel, for review),
+                review_sheets.py (before/after sheets + decision table),
+                outline_check.py / edge_zoom.py (inspect detected outlines)
 ```
 
 `Scans/`, `output/` and `models/` are not tracked by git.

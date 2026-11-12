@@ -673,6 +673,12 @@ def detect_cover(img: np.ndarray, fit_bow: bool = True, dpi: float | None = None
     img_blur = cv2.GaussianBlur(img, (0, 0), 1.0)
     if det.disc is not None:
         cx, cy, r, conf = _refine_disc(img_blur, *det.disc)
+        if dpi:
+            # discs are 120 mm (CD/DVD) or 80 mm (mini CD) across; a round
+            # picture printed on a white cover is not a disc
+            mm = 2 * r / dpi * 25.4
+            if not any(abs(mm - d) <= 0.04 * d for d in (120.0, 80.0)):
+                conf = 0.0
         if conf >= 0.5:
             det.disc = [cx, cy, r]
             det.corners = np.array([[cx - r, cy - r], [cx + r, cy - r],
@@ -696,8 +702,9 @@ def detect_cover(img: np.ndarray, fit_bow: bool = True, dpi: float | None = None
     lid = np.asarray(det.bg_color, np.float32)
     moved = [False] * 4
     flat_jump = [False] * 4
+    faint_used = [False] * 4
     at_border = [False] * 4
-    for _pass in range(2):
+    for _pass in range(3):
         center = corners.mean(axis=0)
         starts, ends = [], []       # tangent lines of each side at its two ends
         for i in range(4):
@@ -738,9 +745,22 @@ def detect_cover(img: np.ndarray, fit_bow: bool = True, dpi: float | None = None
                             f"{SIDE_NAMES[i]} edge found {-move:.0f} px inside the rough "
                             "outline (uneven scanner lid).")
             if fit is None:
+                # last resort: a faint but straight edge (white on white)
+                inner = int(0.25 * min(side_len))
+                s3, o3, band3 = _sample_band(img_blur, a, t, n, length, radius, inner=inner)
+                faint = _faint_edge(band3, o3, s3)
+                if faint is not None and faint[1] >= 0.7:
+                    coef = faint[0]
+                    for sv, store in ((0.0, starts), (length, ends)):
+                        d = t + n * np.polyval(np.polyder(coef), sv)
+                        store.append((a + t * sv + n * np.polyval(coef, sv), d / np.hypot(*d)))
+                    conf[i] = 0.35                     # usable, but not trusted
+                    found[i] = True
+                    faint_used[i] = True
+                    continue
                 starts.append((a, t))
                 ends.append((a, t))
-                if _pass == 1 and not found[i]:
+                if _pass == 2 and not found[i]:
                     det.notes.append(f"{SIDE_NAMES[i]} edge not visible against the "
                                      "background; using a rough estimate.")
                 continue
@@ -751,6 +771,28 @@ def detect_cover(img: np.ndarray, fit_bow: bool = True, dpi: float | None = None
             samples[i] = a + np.outer(s[inl], t) + np.outer(e[inl], n)
             conf[i] = frac
             found[i] = True
+        # A cover is a rectangle: a side without a trustworthy edge of its
+        # own runs parallel to its opposite side when that one is reliable.
+        for i in range(4):
+            if conf[i] >= 0.5:
+                continue
+            j = (i + 2) % 4
+            pi = (starts[i][0] + ends[i][0]) / 2
+            cur = (starts[i][1] + ends[i][1]) / 2
+            if conf[j] >= 0.5:
+                d = -(starts[j][1] + ends[j][1]) / 2           # opposite sides run reversed
+            else:
+                nb = [k for k in ((i - 1) % 4, (i + 1) % 4) if conf[k] >= 0.5]
+                if not nb:
+                    continue
+                k = max(nb, key=lambda q: conf[q])
+                dk = (starts[k][1] + ends[k][1]) / 2
+                d = np.array([-dk[1], dk[0]])                  # perpendicular to a neighbour
+                if np.dot(d, cur) < 0:
+                    d = -d
+            d = d / max(np.hypot(*d), 1e-9)
+            starts[i] = (pi, d)
+            ends[i] = (pi, d)
         new = np.zeros((4, 2))
         for i in range(4):
             p = _intersect(*ends[i - 1], *starts[i])
