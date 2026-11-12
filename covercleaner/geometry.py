@@ -686,58 +686,121 @@ def _robust_poly(x, y, basis, iters=6, scale=1.0):
     return coef
 
 
-# Formats used to place edges that cannot be seen, as (width, height) in mm.
-# Only the CD booklet: other formats (tray inlays, sleeves, digipaks) vary
-# too much in practice, and snapping a non-standard cover to them was wrong
-# more often than right on the test scans.
+# Standard jacket sizes (width, height) in mm, used to place edges that
+# cannot be seen.  Slim-case inserts are wider than tall and have notches cut
+# out along their spine side, which is why that edge is often hard to find.
 STANDARD_FORMATS_MM = {
     "CD booklet": (120.0, 120.0),
+    "slim-case insert": (135.5, 120.0),
 }
 
 
-def _snap_to_standard(corners, conf, weak, dpi, notes):
-    """Use standard media sizes to place edges that could not be seen.
+def _snap_to_standard(corners, conf, weak, dpi, notes, img_blur=None, fixed=(False,) * 4,
+                      lid=None):
+    """Use standard jacket sizes to place edges that could not be seen.
 
-    The format (see STANDARD_FORMATS_MM) whose width and height best match
-    the measurement is chosen.  For each dimension with one reliable and one
-    weak side, a
-    length within 4 % of the format is snapped to it by moving the weak
-    side; within 12 % when the other dimension matches the format reliably
-    (to 1.5 %).
+    From each reliable side, the opposite side is predicted at each standard
+    size (at the scan's DPI).  For a side that was not reliably found:
+      * an edge found near a prediction (+-2 %) is used - this catches a
+        rough outline far outside the cover (shaded lid) or inside it (white
+        margin); the prediction with the clearest edge wins;
+      * without such an edge, the side is snapped to the nearest standard
+        size only when within 4 % (12 % for a square booklet whose other
+        dimension is reliably 120 mm).
+    When both sides look reliable but the length is 2-6 % off the nearest
+    size, one of them may be a lid feature: if exactly one side has a clear
+    edge at its predicted position, it moves there.
     """
-    if not dpi or dpi < 100:
+    if not dpi or dpi < 100 or img_blur is None:
         return corners
     px = dpi / 25.4
     c = corners.copy()
     w, h = output_size(c)
+    center = c.mean(axis=0)
 
     def reliable(i):
         return conf[i] >= 0.5 and not weak[i]
 
-    name, (fw, fh) = min(STANDARD_FORMATS_MM.items(),
-                         key=lambda kv: max(abs(kv[1][0] * px - w) / (kv[1][0] * px),
-                                            abs(kv[1][1] * px - h) / (kv[1][1] * px)))
-    target = {"w": fw * px, "h": fh * px}
-    fits = {"w": abs(w - target["w"]) <= 0.015 * target["w"],
-            "h": abs(h - target["h"]) <= 0.015 * target["h"]}
-    sure = {"w": reliable(1) and reliable(3), "h": reliable(0) and reliable(2)}
-    center = c.mean(axis=0)
-    for dim, other, length, pair in (("w", "h", w, (1, 3)), ("h", "w", h, (0, 2))):
-        a_ok, b_ok = reliable(pair[0]), reliable(pair[1])
-        if a_ok == b_ok:
-            continue                                   # both sure, or both unsure
-        tol = 0.12 if (sure[other] and fits[other]) else 0.04
-        goal = target[dim]
-        if abs(goal - length) > tol * goal or abs(goal - length) < 3:
-            continue
-        mm = fw if dim == "w" else fh
-        side = pair[1] if a_ok else pair[0]
-        delta = goal - length                          # >0: move the side outward
+    def edge_near(side, dev):
+        """Offset of a real edge near side+dev (along its normal), and confidence."""
+        _, n, _ = _side_frame(c[side], c[(side + 1) % 4], center)
+        pa = c[side] + n * dev
+        pb = c[(side + 1) % 4] + n * dev
+        t2, n2, l2 = _side_frame(pa, pb, center + n * dev)
+        r = int(max(40, 0.02 * 120 * px))
+        s2, o2, band2 = _sample_band(img_blur, pa, t2, n2, l2, r)
+        fit = _fit_side(s2, _pick_edges(band2, o2, sens=2.0))
+        if fit is None:
+            return None
+        return float(np.polyval(fit[0], l2 / 2)), fit[1]
+
+    def move(side, delta, text):
+        nonlocal c
         _, n, _ = _side_frame(c[side], c[(side + 1) % 4], center)
         c[side] = c[side] + n * delta
         c[(side + 1) % 4] = c[(side + 1) % 4] + n * delta
-        notes.append(f"{SIDE_NAMES[side]} edge placed from the standard {name} size "
-                     f"({mm:g} mm, {delta:+.0f} px); the edge itself is not clearly visible.")
+        notes.append(f"{SIDE_NAMES[side]} edge {delta:+.0f} px: {text}.")
+
+    sizes = {"w": sorted({f[0] for f in STANDARD_FORMATS_MM.values()}),
+             "h": sorted({f[1] for f in STANDARD_FORMATS_MM.values()})}
+    names = {}
+    for nm, (fw, fh) in STANDARD_FORMATS_MM.items():
+        names.setdefault(("w", fw), nm)
+        names.setdefault(("h", fh), nm)
+    square = {"w": reliable(0) and reliable(2) and abs(h - 120 * px) <= 0.015 * 120 * px,
+              "h": reliable(1) and reliable(3) and abs(w - 120 * px) <= 0.015 * 120 * px}
+
+    for dim, length, pair in (("w", w, (1, 3)), ("h", h, (0, 2))):
+        if any(fixed[k] for k in pair):
+            continue                                   # a side is the scan's own edge
+        a_ok, b_ok = reliable(pair[0]), reliable(pair[1])
+        if not a_ok and not b_ok:
+            continue
+        nearest = min(sizes[dim], key=lambda mm: abs(mm * px - length))
+        if a_ok and b_ok:
+            dev = nearest * px - length
+            if 0.02 * nearest * px <= abs(dev) <= 0.06 * nearest * px:
+                hits = {}
+                for side in pair:
+                    r_ = edge_near(side, dev)
+                    if r_ is not None and r_[1] >= 0.5:
+                        hits[side] = dev + r_[0]
+                if len(hits) == 1:
+                    side, delta = next(iter(hits.items()))
+                    move(side, delta, f"moved to the edge found where the "
+                                      f"{names[(dim, nearest)]} size puts it")
+            continue
+        side = pair[1] if a_ok else pair[0]
+        best = None                                    # (confidence, delta, mm)
+        for mm in sizes[dim]:
+            dev = mm * px - length
+            if abs(dev) > 0.40 * mm * px:
+                continue
+            r_ = edge_near(side, dev)
+            if r_ is not None and r_[1] >= 0.4 and (best is None or r_[1] > best[0]):
+                best = (r_[1], dev + r_[0], mm)
+        if best is not None:
+            if abs(best[1]) >= 3:
+                move(side, best[1], f"placed on the edge found where the "
+                                    f"{names[(dim, best[2])]} size ({best[2]:g} mm) puts it")
+            continue
+        dev = nearest * px - length
+        tol = 0.04
+        booklet_dev = 120.0 * px - length
+        if square[dim] and lid is not None and booklet_dev < 0                 and abs(booklet_dev) <= 0.12 * 120.0 * px:
+            # Is everything between this side and the square-booklet position
+            # plain lid?  Then the cover cannot reach further: it is a booklet
+            # (a slim-case insert would show printed cover there).
+            _, n, slen = _side_frame(c[side], c[(side + 1) % 4], center)
+            t_, n_, l_ = _side_frame(c[side], c[(side + 1) % 4], center)
+            s_, o_, band_ = _sample_band(img_blur, c[side], t_, n_, l_, 4,
+                                         inner=int(abs(booklet_dev)) + 4)
+            coef_ = np.array([0.0, 0.0, booklet_dev + 0.0])
+            if _cut_looks_like_lid(band_, o_, s_, coef_, lid):
+                nearest, dev, tol = 120.0, booklet_dev, 0.12
+        if 3 <= abs(dev) <= tol * nearest * px:
+            move(side, dev, f"placed from the standard {names[(dim, nearest)]} size "
+                            f"({nearest:g} mm); the edge itself is not clearly visible")
     return c
 
 
@@ -1007,9 +1070,8 @@ def detect_cover(img: np.ndarray, fit_bow: bool = False, dpi: float | None = Non
         corners = _square_up(corners, conf)
         det.notes.append("Cropped to the edge of the print, past a thin rim or something "
                          "under the jacket: " + ", ".join(moved_under) + ".")
-    weak = [(not found[i]) or conf[i] < 0.3 or flat_jump[i] for i in range(4)]
-    if any(weak[i] and not at_border[i] for i in range(4)):
-        corners = _snap_to_standard(corners, conf, weak, dpi, det.notes)
+    weak = [(not found[i]) or conf[i] < 0.3 or flat_jump[i] or faint_used[i] for i in range(4)]
+    corners = _snap_to_standard(corners, conf, weak, dpi, det.notes, img_blur, at_border, lid)
     center = corners.mean(axis=0)
 
     # ---- bow (curved edges) and trim suggestions -------------------------
