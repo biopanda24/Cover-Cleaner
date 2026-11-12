@@ -342,6 +342,62 @@ def _cut_looks_like_lid(band, o, s, coef, lid_colour) -> bool:
     return texture < LID_TEXTURE and float(np.abs(colour - lid_colour).max()) < 0.12
 
 
+WEAR_DEPTH = 40         # px inspected inward from each paper edge
+WEAR_REF = (24, 37)     # depths whose colour stands for "the picture there"
+
+
+def edge_wear(img_blur, a, t, n, length, max_depth):
+    """Width (px) of a worn or discoloured band along one paper edge.
+
+    Worn edges, whitened folds, the white core of a cut edge and lid light
+    bleeding onto dark covers all shift the colour near the edge the same
+    way along (almost) the whole side.  Picture that simply runs to the
+    edge is sometimes lighter, sometimes darker there.  So a depth counts as
+    worn when at least 75% of positions along the side differ from their
+    own colour further inside in one direction and hardly any in the other.
+    Wear is also strongest at the very edge and fades inward; a band of
+    constant strength is a printed stripe or a picture feature running
+    parallel to the edge, and is kept.
+
+    Returns (width, direction) with direction "lighter" / "darker" / "".
+    """
+    s, o, band = _sample_band(img_blur, a, t, n, length, 0, margin=0.05, inner=WEAR_DEPTH)
+    if len(s) < 20:
+        return 0, ""
+    band = cv2.blur(band, (1, 9))                                # along the side
+    ref = np.median(band[:, WEAR_REF[0]:WEAR_REF[1]], axis=1)    # (pos, 3)
+    diff = band - ref[:, None, :]
+    lum = luminance(diff)
+    size = np.abs(diff).max(axis=2)
+    shifted = size > 0.03                                        # about 8 levels
+    lighter = shifted & (lum > 0)
+    darker = shifted & (lum < 0)
+    ref_lum = luminance(ref[:, None, :])[:, 0]
+    best = (0, "")
+    for kind, hit, other, room in (("lighter", lighter, darker, ref_lum < 0.90),
+                                   ("darker", darker, lighter, ref_lum > 0.08)):
+        if room.sum() < 0.3 * len(s):
+            continue                     # the edge can't get any lighter/darker
+        frac = hit[room].mean(axis=0)
+        opp = other[room].mean(axis=0)
+        strength = np.median(size[room], axis=0)                 # per depth
+        end = 0
+        # depths 0-1 straddle the edge itself and are trimmed anyway
+        for d in range(2, max_depth + 1):
+            if frac[d] < 0.75 or opp[d] > 0.15:
+                end = d
+                break
+        else:
+            end = max_depth
+        visible = strength[2] >= 0.06                            # ~15 levels
+        # fading inside the band, not just stopping at its end
+        fades = strength[end] <= 0.5 * strength[2] and \
+            (end - 1 <= 2 or strength[end - 1] <= 0.7 * strength[2])
+        if end > 2 and visible and fades and end > best[0]:
+            best = (end, kind)
+    return best
+
+
 def _robust_poly(x, y, basis, iters=6, scale=1.0):
     """IRLS (Huber) least squares on a given basis matrix."""
     w = np.ones_like(y)
@@ -454,12 +510,25 @@ def detect_cover(img: np.ndarray, fit_bow: bool = True) -> CoverDetection:
             if np.abs(bow[i]).max() < 0.6:
                 bow[i] = 0.0
 
-    # Trim: remove the anti-aliased edge and typical inward nicks. Order l,t,r,b.
+    # Trim: remove the anti-aliased edge, typical inward nicks and a worn or
+    # discoloured band along the edge. Order l,t,r,b.
     trims = []
+    worn = []
+    max_wear = int(min(18, 0.008 * min(side_len)))
     for i in range(4):
         r = resid_all[i]
         inward = np.percentile(np.maximum(0.0, -r), 90) if len(r) else 0.0
-        trims.append(int(np.ceil(2.0 + min(inward, 0.01 * min(side_len)))))
+        trim = int(np.ceil(2.0 + min(inward, 0.01 * min(side_len))))
+        if found[i] and max_wear > 2:
+            a, b = corners[i], corners[(i + 1) % 4]
+            t, n, length = _side_frame(a, b, center)
+            width, kind = edge_wear(img_blur, a, t, n, length, max_wear)
+            if width + 1 > trim:
+                trim = width + 1
+                worn.append(f"{SIDE_NAMES[i]} {width} px ({kind})")
+        trims.append(trim)
+    if worn:
+        det.notes.append("Worn / discoloured paper edge trimmed: " + ", ".join(worn) + ".")
     det.trim = [trims[3], trims[0], trims[1], trims[2]]
 
     top = corners[1] - corners[0]

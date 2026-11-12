@@ -141,6 +141,23 @@ def test_edge_far_inside_rough_outline_is_found(monkeypatch):
     assert any("inside the rough outline" in n for n in det.notes)
 
 
+def test_worn_edge_is_trimmed_but_printed_edge_stripe_is_kept():
+    cover = make_cover(size=1800)
+    # left: worn, whitened paper fading over 10 px
+    x = np.arange(10, dtype=np.float32)
+    wear = (0.85 * (1 - x / 10) ** 1.2)[None, :, None]
+    cream = np.float32([0.80, 0.90, 0.97])
+    cover[:, :10] = cover[:, :10] * (1 - wear) + cream * wear
+    # right: a printed stripe of even colour running along the edge
+    cover[:, -10:] = (0.6, 0.2, 0.1)
+    scan, truth = place_on_scanner(cover, angle=0.0, shadow=False)
+    det = geometry.detect_cover(scan)
+    left, top, right, bottom = det.trim
+    assert 9 <= left <= 13, det.trim
+    assert right <= 4 and top <= 4 and bottom <= 4, det.trim
+    assert any("Worn" in n and "left" in n for n in det.notes)
+
+
 def test_cover_cut_by_image_border_is_not_cropped_into():
     """A cover running off the image on one side must keep that side at the
     image border, not jump to some edge inside the picture."""

@@ -80,8 +80,13 @@ where a mistake would damage the picture:
   straight edge with nothing but plain lid outside it (no print texture).
 * A paper edge that is white on a white scanner lid with no shadow cannot be
   seen; the report flags it so the corner can be dragged by hand.
-* Worn or discoloured paper along an edge (e.g. a whitened spine fold) is
-  kept; use the Trim boxes to cut it off.
+* Worn or discoloured paper along an edge (a whitened spine fold, the white
+  core of a cut edge, lid light glowing onto a dark cover) is trimmed off,
+  up to 0.8% of the side (18 px at 600 dpi). It must shift the colour the
+  same way along at least 75% of the side, be clearly visible at the edge
+  and fade inward; picture or a printed stripe running to the edge does
+  not, and is kept. The report lists what was trimmed; the Trim boxes
+  override it.
 
 ## Manual control
 
