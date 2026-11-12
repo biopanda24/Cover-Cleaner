@@ -785,7 +785,7 @@ def _snap_to_standard(corners, conf, weak, dpi, notes, img_blur=None, fixed=(Fal
                                     f"{names[(dim, best[2])]} size ({best[2]:g} mm) puts it")
             continue
         dev = nearest * px - length
-        tol = 0.04
+        tol = 0.12 if (nearest == 120.0 and square[dim]) else 0.04
         booklet_dev = 120.0 * px - length
         if square[dim] and lid is not None and booklet_dev < 0                 and abs(booklet_dev) <= 0.12 * 120.0 * px:
             # Is everything between this side and the square-booklet position
