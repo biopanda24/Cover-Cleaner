@@ -30,6 +30,28 @@ def load_image(path: str) -> np.ndarray:
     return np.clip(img.astype(np.float32), 0.0, 1.0)
 
 
+def read_dpi(path: str):
+    """Scan resolution stored in a PNG (pHYs chunk) or TIFF/JPEG, or None."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(1 << 16)
+    except OSError:
+        return None
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        i = head.find(b"pHYs")
+        if i > 0 and i + 13 <= len(head):
+            x = int.from_bytes(head[i + 4:i + 8], "big")
+            unit = head[i + 12]
+            if unit == 1 and x > 0:                   # pixels per metre
+                return x * 0.0254
+        return None
+    if head[:2] == b"\xff\xd8":                         # JPEG JFIF
+        i = head.find(b"JFIF\x00")
+        if i > 0 and head[i + 7] == 1:
+            return float(int.from_bytes(head[i + 8:i + 10], "big")) or None
+    return None
+
+
 def to_uint8(img: np.ndarray) -> np.ndarray:
     return np.clip(img * 255.0 + 0.5, 0, 255).astype(np.uint8)
 

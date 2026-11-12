@@ -65,7 +65,8 @@ class Pipeline:
         if not g.enabled:
             return img
         return _geometry.apply_geometry(img, g.corners, g.bow if g.use_bow else None,
-                                        g.trim, g.rotate90)
+                                        g.trim, g.rotate90, g.disc and g.corners is not None,
+                                        g.angle)
 
     def _descreen(self, img, p: Params):
         d = p.descreen

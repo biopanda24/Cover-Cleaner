@@ -19,7 +19,7 @@ from .. import descreen as _descreen
 from .. import geometry as _geometry
 from .. import ml as _ml
 from ..auto import auto_params
-from ..imageio import SUPPORTED, load_image, save_image
+from ..imageio import SUPPORTED, load_image, read_dpi, save_image
 from ..params import Params
 from ..pipeline import Pipeline
 from .view import ImageView, mask_pixmap, to_pixmap
@@ -303,6 +303,12 @@ class MainWindow(QMainWindow):
             b = QPushButton(text); b.clicked.connect(lambda _=False, s=step: self._rotate(s))
             row.addWidget(b)
         lay.addLayout(row)
+        sl = FloatSlider("Fine rotate °", -45, 45, 1,
+                         "Rotate by a few degrees, e.g. to level the text on a disc. "
+                         "Positive = counter-clockwise.")
+        sl.changed.connect(lambda v: self._set("geometry", "angle", round(float(v), 1)))
+        self._widgets[("geometry", "angle")] = sl
+        lay.addWidget(sl)
         col.addWidget(box)
 
         # --- generic groups
@@ -566,7 +572,7 @@ class MainWindow(QMainWindow):
         src, pipe, path, mode = self.source, self.pipe, self.path, self._mode()
 
         def work(progress):
-            return path, auto_params(src, progress, pipe, mode)
+            return path, auto_params(src, progress, pipe, mode, read_dpi(path))
 
         def done(res):
             self.busy = False
@@ -653,6 +659,7 @@ class MainWindow(QMainWindow):
         c = self._corners()
         c[index] = (x, y)
         self.params.geometry.corners = [[float(a), float(b)] for a, b in c]
+        self.params.geometry.disc = False   # hand-placed corners: plain crop
         self.view.update_outline_only(_geometry.outline_points(c, self._bow()))
         if self.pipe:
             self.pipe.clear_masks()         # painted marks no longer line up
@@ -661,12 +668,13 @@ class MainWindow(QMainWindow):
     def detect_outline(self):
         if self.source is None:
             return
-        det = _geometry.detect_cover(self.source)
+        det = _geometry.detect_cover(self.source, dpi=read_dpi(self.path))
         g = self.params.geometry
         if det.has_background:
             g.corners = [[float(x), float(y)] for x, y in det.corners]
             g.bow = [[float(v) for v in row] for row in det.bow]
             g.trim = [int(t) for t in det.trim]
+            g.disc = det.disc is not None
         else:
             g.corners = None
             self.statusBar().showMessage("No scanner background found around the cover.")
@@ -680,6 +688,7 @@ class MainWindow(QMainWindow):
         g.corners = [[float(x), float(y)] for x, y in _geometry.full_corners(self.source.shape)]
         g.bow = None
         g.trim = [0, 0, 0, 0]
+        g.disc = False
         self.sync_controls()
         self.set_view_mode("original")
         self.request_render()
@@ -887,7 +896,8 @@ class MainWindow(QMainWindow):
                 try:
                     src = load_image(os.path.join(folder, name))
                     pipe = Pipeline(src)
-                    params, report = auto_params(src, None, pipe, mode)
+                    params, report = auto_params(src, None, pipe, mode,
+                                                 read_dpi(os.path.join(folder, name)))
                     dst = os.path.join(out, os.path.splitext(name)[0] + ".png")
                     save_image(dst, pipe.run(params), bits)
                     with open(os.path.splitext(dst)[0] + ".json", "w", encoding="utf8") as fh:

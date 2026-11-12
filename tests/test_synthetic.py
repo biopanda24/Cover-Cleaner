@@ -158,6 +158,76 @@ def test_worn_edge_is_trimmed_but_printed_edge_stripe_is_kept():
     assert any("Worn" in n and "left" in n for n in det.notes)
 
 
+def test_disc_is_found_and_outside_made_white():
+    H, W = 1300, 1800
+    scan = np.full((H, W, 3), 0.975, np.float32)
+    cx, cy, r = 820.0, 640.0, 520.0
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    d = np.hypot(xx - cx, yy - cy)
+    disc = make_cover(size=2 * int(r) + 2)[:H, :W]
+    art = np.zeros_like(scan)
+    y0, x0 = int(cy - r) - 1, int(cx - r) - 1
+    art[y0:y0 + disc.shape[0], x0:x0 + disc.shape[1]] = disc[:H - y0, :W - x0]
+    a = np.clip(r - d + 0.5, 0, 1)[:, :, None]
+    hole = np.clip(d - 60 + 0.5, 0, 1)[:, :, None]          # centre hole shows the lid
+    scan = scan * (1 - a * hole) + art * a * hole
+    scan += np.random.default_rng(3).normal(0, 0.004, scan.shape).astype(np.float32)
+    scan = np.clip(scan, 0, 1).astype(np.float32)
+    det = geometry.detect_cover(scan)
+    assert det.disc is not None, det.notes
+    fx, fy, fr = det.disc
+    assert abs(fx - cx) < 1.5 and abs(fy - cy) < 1.5 and abs(fr - r) < 1.5, det.disc
+    out = geometry.apply_geometry(scan, det.corners, None, det.trim, 0, disc=True)
+    assert out[2, 2].min() > 0.99 and out[-3, -3].min() > 0.99      # outside: white
+    m = out.shape[0] // 2
+    assert np.allclose(out[m, m], scan[int(cy), int(cx)], atol=0.05)
+
+
+def test_text_angle_levels_straight_text():
+    img = np.full((900, 900, 3), 0.95, np.float32)
+    for k, word in enumerate(("CRESCENT", "MAY 2009", "LIMITED", "ANGCD-000")):
+        _text(img, word, (180, 250 + 110 * k), 1.8, 0.1, 3)
+    for true in (5.0, -12.0):
+        m = cv2.getRotationMatrix2D((450, 450), true, 1.0)
+        rot = cv2.warpAffine(img, m, (900, 900), borderValue=(0.95, 0.95, 0.95))
+        ang, strength = geometry.text_angle(rot)
+        assert abs(ang + true) < 0.5 and strength > 1.6, (true, ang, strength)
+        level = geometry.apply_geometry(rot, None, angle=ang)
+        assert abs(geometry.text_angle(level)[0]) < 0.5
+
+
+def test_cover_running_off_the_scan_keeps_that_edge():
+    scan, truth = place_on_scanner(make_cover(), angle=0.0, shadow=False)
+    cut = np.ascontiguousarray(scan[:900])                 # bottom of the cover cut off
+    det = geometry.detect_cover(cut)
+    assert det.has_background and "bottom" in det.off_sides, det.notes
+    assert np.abs(det.corners[0] - truth[0]).max() < 2.5
+    assert np.abs(det.corners[1] - truth[1]).max() < 2.5
+    assert abs(det.corners[2, 1] - 899) < 1 and abs(det.corners[3, 1] - 899) < 1
+    assert det.trim[3] == 0
+
+
+def test_invisible_edge_is_placed_from_cd_booklet_size():
+    # a white cover (120 mm at 600 dpi = 2835 px) whose left edge is invisible
+    side = 2835
+    cover = np.full((side, side, 3), 0.975, np.float32)       # same white as the lid
+    cover[:, 300:] = make_cover(size=side)[:, 300:]          # picture, white left margin
+    scan, truth = place_on_scanner(cover, angle=0.0, margin=150, shadow=False)
+    # a thin lid shadow along the top edge, across the white margin too, is
+    # what lets the rough outline reach the true corner (as on the real scan)
+    shade = np.ones(scan.shape[:2], np.float32)
+    shade[150 - 7:150, 150:150 + side] = 0.75
+    scan = (scan * cv2.GaussianBlur(shade, (0, 0), 1.5)[:, :, None]).astype(np.float32)
+    det = geometry.detect_cover(scan, dpi=600.0)
+    w, h = geometry.output_size(det.corners)
+    assert abs(w - side) <= 6 and abs(h - side) <= 6, (w, h, det.notes)
+    assert any("CD booklet" in n for n in det.notes)
+    assert np.abs(det.corners - truth).max() < 8
+    # without a resolution the margin is lost, but nothing else breaks
+    det2 = geometry.detect_cover(scan)
+    assert geometry.output_size(det2.corners)[0] < side - 200
+
+
 def test_cover_cut_by_image_border_is_not_cropped_into():
     """A cover running off the image on one side must keep that side at the
     image border, not jump to some edge inside the picture."""

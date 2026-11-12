@@ -20,7 +20,7 @@ Progress = Optional[Callable[[str, float], None]]
 
 def auto_params(source: np.ndarray, progress: Progress = None,
                 pipeline: Optional[Pipeline] = None,
-                mode: str = "traditional") -> tuple[Params, list[str]]:
+                mode: str = "traditional", dpi: float | None = None) -> tuple[Params, list[str]]:
     """Return (Params, human readable report) for a scan."""
     p = Params()
     p.mode = mode
@@ -40,7 +40,7 @@ def auto_params(source: np.ndarray, progress: Progress = None,
 
     # ---- 1. geometry -----------------------------------------------------
     step("Finding cover outline", 0.0)
-    det = geometry.detect_cover(source)
+    det = geometry.detect_cover(source, dpi=dpi)
     g = p.geometry
     if det.has_background:
         g.enabled = True
@@ -48,6 +48,7 @@ def auto_params(source: np.ndarray, progress: Progress = None,
         g.bow = [[float(v) for v in row] for row in det.bow]
         g.use_bow = det.max_bow >= 1.5
         g.trim = [int(t) for t in det.trim]
+        g.disc = det.disc is not None
         w, h = geometry.output_size(det.corners)
         report.append(f"Crop/deskew: cover {w} x {h} px found, rotated {det.angle_deg:+.2f} deg; "
                       f"edge trim L{g.trim[0]} T{g.trim[1]} R{g.trim[2]} B{g.trim[3]} px.")
@@ -64,6 +65,18 @@ def auto_params(source: np.ndarray, progress: Progress = None,
     for note in det.notes:
         report.append("  " + note)
     img = pipe.run(p, upto="geometry")
+    if g.disc:
+        # A disc has no edges to straighten: level its straight text instead.
+        ang, strength = geometry.text_angle(img, disc=True)
+        if strength >= 1.6 and abs(ang) >= 0.3:
+            g.angle = round(ang, 2)
+            report.append(f"Disc: rotated {g.angle:+.1f} deg so its straight text is level. "
+                          "Whether it is upright cannot be judged automatically; use the "
+                          "rotate buttons if it is sideways or upside down.")
+            img = pipe.run(p, upto="geometry")
+        else:
+            report.append("Disc: no clear straight text to level it by; rotation left "
+                          "as scanned.")
 
     # ---- 2. halftone screen ----------------------------------------------
     step("Analysing print screen", 0.2)

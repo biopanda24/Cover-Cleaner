@@ -41,6 +41,8 @@ class CoverDetection:
     max_bow: float = 0.0
     bg_color: tuple = (1.0, 1.0, 1.0)
     notes: list = field(default_factory=list)
+    off_sides: list = field(default_factory=list)   # image borders the cover runs past
+    disc: list = None                            # [cx, cy, r] for a round disc
 
 
 # --------------------------------------------------------------------------
@@ -86,7 +88,14 @@ def _side_frame(a, b, center):
 # coarse pass
 # --------------------------------------------------------------------------
 
-def _background_model(small: np.ndarray, m: int):
+IMAGE_SIDES = ("top", "bottom", "left", "right")
+
+
+def _border_strips(a: np.ndarray, m: int) -> dict:
+    return {"top": a[:m], "bottom": a[-m:], "left": a[:, :m], "right": a[:, -m:]}
+
+
+def _background_model(small: np.ndarray, m: int, off=()):
     """Per-pixel estimate of the scanner background (lid) colour.
 
     The lid is not always evenly lit: where it does not lie flat, e.g. lifted
@@ -95,14 +104,19 @@ def _background_model(small: np.ndarray, m: int):
     that side (median filtered, so dust and small objects drop out); inside
     the image the four profiles are blended by inverse squared distance, so
     every pixel is compared with the lid colour of its nearest side.
+    Borders listed in `off` are covered by the cover itself (it runs past
+    the edge of the scan) and only contribute the overall lid colour.
 
     Returns (global background colour, model image).
     """
     sh, sw = small.shape[:2]
-    strips = [small[:m], small[-m:], small[:, :m], small[:, -m:]]
-    glob = np.median(np.concatenate([s.reshape(-1, 3) for s in strips]), axis=0)
+    strips = _border_strips(small, m)
+    lid_strips = [v for k, v in strips.items() if k not in off] or list(strips.values())
+    glob = np.median(np.concatenate([s.reshape(-1, 3) for s in lid_strips]), axis=0)
 
-    def profile(values: np.ndarray, length: int) -> np.ndarray:
+    def profile(side: str, values: np.ndarray, length: int) -> np.ndarray:
+        if side in off:
+            return np.tile(glob.astype(np.float32), (length, 1))
         k = max(3, int(0.08 * length) | 1)
         prof = median_filter(values, size=(k, 1), mode="nearest")
         # Far from the overall lid colour = the cover itself reaches the
@@ -111,10 +125,10 @@ def _background_model(small: np.ndarray, m: int):
         prof[far] = glob
         return prof.astype(np.float32)
 
-    top = profile(np.median(small[:m], axis=0), sw)          # (sw, 3)
-    bottom = profile(np.median(small[-m:], axis=0), sw)
-    left = profile(np.median(small[:, :m], axis=1), sh)      # (sh, 3)
-    right = profile(np.median(small[:, -m:], axis=1), sh)
+    top = profile("top", np.median(small[:m], axis=0), sw)          # (sw, 3)
+    bottom = profile("bottom", np.median(small[-m:], axis=0), sw)
+    left = profile("left", np.median(small[:, :m], axis=1), sh)      # (sh, 3)
+    right = profile("right", np.median(small[:, -m:], axis=1), sh)
     y = np.arange(sh, dtype=np.float32)[:, None] + 1.0
     x = np.arange(sw, dtype=np.float32)[None, :] + 1.0
     wt, wb = 1.0 / y ** 2, 1.0 / (sh + 1.0 - y) ** 2           # (sh, 1)
@@ -133,11 +147,31 @@ def _coarse_rect(img: np.ndarray, det: CoverDetection):
     sh, sw = small.shape[:2]
     m = max(3, int(round(0.012 * max(sh, sw))))
     glob, model = _background_model(small, m)
-    det.bg_color = tuple(float(x) for x in glob)
     dist = np.abs(small - model).max(axis=2)
-    bdist = np.concatenate([dist[:m].ravel(), dist[-m:].ravel(),
-                            dist[:, :m].ravel(), dist[:, -m:].ravel()])
-    if np.percentile(bdist, 85) > 0.10:
+    # A border mostly unlike the lid is covered by the cover itself: it runs
+    # past that edge of the scan.  Up to two such borders are accepted.
+    def covered_run(strip: np.ndarray, along: int) -> float:
+        """Longest stretch of the border (fraction) where the cover lies."""
+        hit = np.median(strip > 0.06, axis=along) > 0.5
+        best = cur = 0
+        for v in hit:
+            cur = cur + 1 if v else 0
+            best = max(best, cur)
+        return best / max(1, len(hit))
+
+    strips = _border_strips(dist, m)
+    off = tuple(k for k, v in strips.items()
+                if covered_run(v, 0 if k in ("top", "bottom") else 1) > 0.2)
+    if 0 < len(off) <= 2 and set(off) not in ({"top", "bottom"}, {"left", "right"}):
+        glob, model = _background_model(small, m, off)
+        dist = np.abs(small - model).max(axis=2)
+        det.off_sides = list(off)
+        det.notes.append("Cover runs past the " + " and ".join(off) + " edge of the scan; "
+                         "that edge is kept as it is.")
+    det.bg_color = tuple(float(x) for x in glob)
+    bdist = np.concatenate([v.ravel() for k, v in _border_strips(dist, m).items()
+                            if k not in det.off_sides])
+    if len(det.off_sides) != len(off) or np.percentile(bdist, 85) > 0.10:
         det.notes.append("Image border is not a uniform scanner background; "
                          "assuming the scan is already cropped.")
         return None
@@ -166,7 +200,42 @@ def _coarse_rect(img: np.ndarray, det: CoverDetection):
     if area < 0.08 * sh * sw:
         det.notes.append("Detected object is too small to be the cover.")
         return None
+    # A disc (CD / DVD) fills its enclosing circle but only pi/4 of its box.
+    (cx, cy), cr = cv2.minEnclosingCircle(hull)
+    hull_area = float(cv2.contourArea(hull))
+    if not det.off_sides and hull_area > 0.92 * np.pi * cr * cr and hull_area < 0.85 * area:
+        det.disc = [cx / scale, cy / scale, cr / scale]
     return _order_corners(box / scale)
+
+
+def _refine_disc(img_blur: np.ndarray, cx: float, cy: float, r: float):
+    """Fit the disc's rim at full resolution: edge picks along 720 rays, then a
+    robust least-squares circle."""
+    ang = np.linspace(0, 2 * np.pi, 720, endpoint=False)
+    reach = max(30.0, 0.03 * r)
+    o = np.arange(reach, -reach - 1, -1.0)                  # outside -> inside
+    rad = r + o[None, :]
+    px = (cx + np.cos(ang)[:, None] * rad).astype(np.float32)
+    py = (cy + np.sin(ang)[:, None] * rad).astype(np.float32)
+    band = cv2.remap(img_blur, px, py, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    e = _pick_edges(band, o)
+    ok = np.isfinite(e)
+    if ok.sum() < 100:
+        return cx, cy, r, 0.0
+    x = cx + np.cos(ang[ok]) * (r + e[ok])
+    y = cy + np.sin(ang[ok]) * (r + e[ok])
+    keep = np.ones(len(x), bool)
+    for _ in range(4):
+        # algebraic circle fit: x^2 + y^2 + D x + E y + F = 0
+        A = np.column_stack([x[keep], y[keep], np.ones(keep.sum())])
+        rhs = -(x[keep] ** 2 + y[keep] ** 2)
+        D, E, F = np.linalg.lstsq(A, rhs, rcond=None)[0]
+        ccx, ccy = -D / 2, -E / 2
+        rr = float(np.sqrt(max(ccx ** 2 + ccy ** 2 - F, 1.0)))
+        res = np.abs(np.hypot(x - ccx, y - ccy) - rr)
+        keep = res < max(2.0, 2.5 * float(np.median(res[keep])))
+    conf = float((res < 3.0).sum()) / len(ang)
+    return float(ccx), float(ccy), rr, conf
 
 
 # --------------------------------------------------------------------------
@@ -188,8 +257,22 @@ def _sample_band(img_blur, a, t, n, length, radius, step=2.0, margin=0.03, inner
     return s, o, band
 
 
+SHARP_NEAR = 4      # px either side over which a paper edge must show its step
+
+
 def _pick_edges(band: np.ndarray, o: np.ndarray):
-    """Locate the paper edge in every row of a band. Returns offsets (nan = none)."""
+    """Locate the paper edge in every row of a band. Returns offsets (nan = none).
+
+    The paper edge is the outermost *sharp* transition.  Lid shadows and a
+    lid lifted by a booklet spine change the brightness gradually over tens
+    to hundreds of pixels.  Each monotone transition is taken as a whole
+    (ramp plus the step at its end) and located at its steepest point; it
+    counts only if that point changes the colour visibly within +-4 px.
+    """
+    # Texture along the edge, measured before averaging along it: halftone
+    # print varies from dot to dot, a shadow on the lid is uniform.
+    tex = np.abs(band - cv2.GaussianBlur(band, (1, 5), 1.0)).max(axis=2)
+    tex = cv2.blur(tex, (1, 15))
     band = cv2.blur(band, (1, 15))                       # average along the edge
     lum = luminance(band)
     dl = np.gradient(lum, axis=1)
@@ -199,33 +282,69 @@ def _pick_edges(band: np.ndarray, o: np.ndarray):
     outer = g[:, : max(4, g.shape[1] // 4)]
     noise = 1.4826 * np.median(np.abs(outer - np.median(outer)))
     thr = max(6.0 * noise, 0.010)
+    min_step = max(0.02, 2.0 * thr)
     out = np.full(g.shape[0], np.nan)
     ncol = g.shape[1]
+    cs = np.concatenate([np.zeros((band.shape[0], 1, 3), np.float64),
+                         np.cumsum(band, axis=1, dtype=np.float64)], axis=1)
+    gs = cv2.blur(g.astype(np.float32), (9, 1))         # smoothed across the edge
+
+    def step(r, p, k):
+        """Colour difference between the k px after and the k px before p."""
+        a0, a1 = max(0, p - k), p
+        b0, b1 = p + 1, min(ncol, p + 1 + k)
+        if a1 <= a0 or b1 <= b0:
+            return 0.0
+        before = (cs[r, a1] - cs[r, a0]) / (a1 - a0)
+        after = (cs[r, b1] - cs[r, b0]) / (b1 - b0)
+        return float(np.abs(after - before).max())
+
     for r in range(g.shape[0]):
         row = g[r]
-        idx = np.flatnonzero(np.abs(row) > thr)
-        if idx.size == 0:
+        cand = np.flatnonzero(np.abs(row) > thr)
+        p = -1
+        sgn = 0.0
+        j = -1
+        ci = 0
+        rs = gs[r]
+        while ci < cand.size:
+            i0 = int(cand[ci])
+            s0 = np.sign(row[i0])
+            # The whole monotone transition (a shadow ramp running into the
+            # paper edge included) is one run; small dips in the gradient
+            # do not split it.  Its steepest point is the edge.
+            j0 = i0
+            while j0 + 1 < ncol and rs[j0 + 1] * s0 > thr * 0.1:
+                j0 += 1
+            seg = row[i0:j0 + 1] * s0
+            pk = i0 + int(np.argmax(seg))
+            if step(r, pk, SHARP_NEAR) >= min_step:
+                p, sgn, j = pk, s0, j0
+                break
+            ci = int(np.searchsorted(cand, j0 + 1))        # too soft: look further in
+        if p < 2:                                         # none, or beyond the band
             continue
-        i0 = int(idx[0])
-        if i0 < 2:                                        # edge beyond the band
-            continue
-        sgn = np.sign(row[i0])
-        j = i0
-        while j + 1 < ncol and row[j + 1] * sgn > thr * 0.3:
-            j += 1
-        p = i0 + int(np.argmax(np.abs(row[i0:j + 1])))
         if sgn < 0:
-            # A darkening run followed directly by a brightening run is the
-            # lid shadow next to lighter paper: the paper edge is the rise.
-            k = j + 1
-            lim = min(ncol - 1, j + 5)
+            # A darkening edge followed shortly by a brightening one, with a
+            # smooth (unprinted) stretch between them, is a shadow line on
+            # the lid next to the paper: the paper edge is the rise.  Dark
+            # print right inside the edge has halftone texture and is kept.
+            k = p + 2
+            lim = min(ncol - 1, p + 22)
             while k <= lim and row[k] <= thr:
                 k += 1
             if k <= lim:
                 k2 = k
                 while k2 + 1 < ncol and row[k2 + 1] > thr * 0.3:
                     k2 += 1
-                p = k + int(np.argmax(row[k:k2 + 1]))
+                rise = k + int(np.argmax(row[k:k2 + 1]))
+                a0, a1 = min(p + 3, ncol - 1), min(ncol, max(p + 4, rise - 3))
+                seg_c = band[r, a0:a1]
+                neutral = float((seg_c.max(axis=1) - seg_c.min(axis=1)).mean()) < 0.15
+                smooth = neutral and float(tex[r, a0:a1].mean()) < 0.006
+                up = step(r, rise, SHARP_NEAR)
+                if smooth and up >= min_step and up >= 0.2 * step(r, p, SHARP_NEAR):
+                    p = rise
         # sub-pixel parabola refinement
         if 0 < p < ncol - 1:
             y0, y1, y2 = abs(row[p - 1]), abs(row[p]), abs(row[p + 1])
@@ -316,10 +435,75 @@ def _fit_side(s, e):
             inl = np.abs(e1 - np.polyval(coef, s1)) < 1.5
     mask = np.zeros(len(e), bool)
     mask[np.flatnonzero(ok)[inl]] = True
-    return coef, float(inl.sum()) / len(e), mask
+    # Confidence: share of the side whose edge lies within 3 px of the fit.
+    # (Edges of paper lifted off the glass are slightly out of focus, so
+    # the 1.5 px inlier tolerance used for fitting would understate it.)
+    conf = float((np.abs(e1 - np.polyval(coef, s1)) < 3.0).sum()) / len(e)
+    return coef, conf, mask
 
 
 LID_TEXTURE = 0.004     # high-frequency level: bare lid < ~0.0025, print > ~0.005
+
+
+def _faint_edge(band: np.ndarray, o: np.ndarray, s: np.ndarray, chunks: int = 10):
+    """Find a faint but straight paper edge (white paper on a white lid).
+
+    The band is averaged along the side in `chunks` pieces, which lowers the
+    noise enough to see steps of 2-3 levels.  In each piece the outermost
+    small but sharp step is taken; the pieces must agree on a straight line.
+    Returns (coef, confidence) like _fit_side, or None.
+    """
+    rows = band.shape[0]
+    if rows < chunks * 4:
+        return None
+    lum = luminance(band)
+    picks_s, picks_e = [], []
+    for k in range(chunks):
+        r0, r1 = k * rows // chunks, (k + 1) * rows // chunks
+        prof = cv2.GaussianBlur(lum[r0:r1].mean(axis=0)[None, :].astype(np.float32),
+                                (0, 0), 1.5)[0]
+        g = np.gradient(prof)
+        outer = g[: max(8, len(g) // 6)]
+        noise = 1.4826 * float(np.median(np.abs(outer - np.median(outer)))) + 1e-5
+        thr = max(5.0 * noise, 0.0015)
+        idx = np.flatnonzero(np.abs(g) > thr)
+        for i in idx:
+            if i < 6 or i > len(g) - 6:
+                continue
+            stepv = abs(prof[i + 4] - prof[i - 4])
+            if stepv >= 0.007:                              # ~2 levels, within 8 px
+                picks_s.append(float(s[(r0 + r1) // 2]))
+                picks_e.append(float(o[i]))
+                break
+    if len(picks_s) < 0.7 * chunks:
+        return None
+    ps, pe = np.array(picks_s), np.array(picks_e)
+    coef = np.polyfit(ps, pe, 1)
+    res = np.abs(pe - np.polyval(coef, ps))
+    inl = res < 4.0
+    if inl.sum() < 0.7 * chunks or abs(coef[0]) > 0.03:
+        return None
+    coef = np.polyfit(ps[inl], pe[inl], 1)
+    full = np.zeros(3)
+    full[1:] = coef
+    return full, float(inl.sum()) / chunks
+
+
+def _off_border_line(a, b, n, w, h, off_sides):
+    """If side a-b lies along an image border the cover runs past, return
+    that border as a (point, direction) line, else None."""
+    if not off_sides:
+        return None
+    tol = 0.02 * min(w, h)
+    if "top" in off_sides and n[1] < -0.7 and max(a[1], b[1]) < tol:
+        return np.array([0.0, 0.0]), np.array([1.0, 0.0])
+    if "bottom" in off_sides and n[1] > 0.7 and min(a[1], b[1]) > h - 1 - tol:
+        return np.array([0.0, h - 1.0]), np.array([1.0, 0.0])
+    if "left" in off_sides and n[0] < -0.7 and max(a[0], b[0]) < tol:
+        return np.array([0.0, 0.0]), np.array([0.0, 1.0])
+    if "right" in off_sides and n[0] > 0.7 and min(a[0], b[0]) > w - 1 - tol:
+        return np.array([w - 1.0, 0.0]), np.array([0.0, 1.0])
+    return None
 
 
 def _on_image_border(a, b, w, h, tol=4.0) -> bool:
@@ -392,10 +576,21 @@ def edge_wear(img_blur, a, t, n, length, max_depth):
         visible = strength[2] >= 0.06                            # ~15 levels
         # fading inside the band, not just stopping at its end
         fades = strength[end] <= 0.5 * strength[2] and \
-            (end - 1 <= 2 or strength[end - 1] <= 0.7 * strength[2])
+            (end - 3 <= 2 or strength[end - 3] <= 0.7 * strength[2])
         if end > 2 and visible and fades and end > best[0]:
             best = (end, kind)
     return best
+
+
+def _cut_is_bright_lid(band, o, s, coef, lid_colour) -> bool:
+    """The cut-away region is indistinguishable from bright, even lid (as
+    opposed to a darker, shaded part of the lid)."""
+    edge = np.polyval(coef, s)[:, None]
+    region = (o[None, :] <= 0) & (o[None, :] > edge + 6)
+    if region.sum() < 50:
+        return False
+    colour = np.median(band[region], axis=0)
+    return float(np.abs(colour - lid_colour).max()) < 0.02
 
 
 def _robust_poly(x, y, basis, iters=6, scale=1.0):
@@ -410,7 +605,62 @@ def _robust_poly(x, y, basis, iters=6, scale=1.0):
     return coef
 
 
-def detect_cover(img: np.ndarray, fit_bow: bool = True) -> CoverDetection:
+# Formats used to place edges that cannot be seen, as (width, height) in mm.
+# Only the CD booklet: other formats (tray inlays, sleeves, digipaks) vary
+# too much in practice, and snapping a non-standard cover to them was wrong
+# more often than right on the test scans.
+STANDARD_FORMATS_MM = {
+    "CD booklet": (120.0, 120.0),
+}
+
+
+def _snap_to_standard(corners, conf, weak, dpi, notes):
+    """Use standard media sizes to place edges that could not be seen.
+
+    The format (see STANDARD_FORMATS_MM) whose width and height best match
+    the measurement is chosen.  For each dimension with one reliable and one
+    weak side, a
+    length within 4 % of the format is snapped to it by moving the weak
+    side; within 12 % when the other dimension matches the format reliably
+    (to 1.5 %).
+    """
+    if not dpi or dpi < 100:
+        return corners
+    px = dpi / 25.4
+    c = corners.copy()
+    w, h = output_size(c)
+
+    def reliable(i):
+        return conf[i] >= 0.5 and not weak[i]
+
+    name, (fw, fh) = min(STANDARD_FORMATS_MM.items(),
+                         key=lambda kv: max(abs(kv[1][0] * px - w) / (kv[1][0] * px),
+                                            abs(kv[1][1] * px - h) / (kv[1][1] * px)))
+    target = {"w": fw * px, "h": fh * px}
+    fits = {"w": abs(w - target["w"]) <= 0.015 * target["w"],
+            "h": abs(h - target["h"]) <= 0.015 * target["h"]}
+    sure = {"w": reliable(1) and reliable(3), "h": reliable(0) and reliable(2)}
+    center = c.mean(axis=0)
+    for dim, other, length, pair in (("w", "h", w, (1, 3)), ("h", "w", h, (0, 2))):
+        a_ok, b_ok = reliable(pair[0]), reliable(pair[1])
+        if a_ok == b_ok:
+            continue                                   # both sure, or both unsure
+        tol = 0.12 if (sure[other] and fits[other]) else 0.04
+        goal = target[dim]
+        if abs(goal - length) > tol * goal or abs(goal - length) < 3:
+            continue
+        mm = fw if dim == "w" else fh
+        side = pair[1] if a_ok else pair[0]
+        delta = goal - length                          # >0: move the side outward
+        _, n, _ = _side_frame(c[side], c[(side + 1) % 4], center)
+        c[side] = c[side] + n * delta
+        c[(side + 1) % 4] = c[(side + 1) % 4] + n * delta
+        notes.append(f"{SIDE_NAMES[side]} edge placed from the standard {name} size "
+                     f"({mm:g} mm, {delta:+.0f} px); the edge itself is not clearly visible.")
+    return c
+
+
+def detect_cover(img: np.ndarray, fit_bow: bool = True, dpi: float | None = None) -> CoverDetection:
     """Locate the cover in a scan. `img` is float32 BGR 0..1."""
     h, w = img.shape[:2]
     det = CoverDetection(corners=full_corners(img.shape),
@@ -421,6 +671,19 @@ def detect_cover(img: np.ndarray, fit_bow: bool = True) -> CoverDetection:
         return det
 
     img_blur = cv2.GaussianBlur(img, (0, 0), 1.0)
+    if det.disc is not None:
+        cx, cy, r, conf = _refine_disc(img_blur, *det.disc)
+        if conf >= 0.5:
+            det.disc = [cx, cy, r]
+            det.corners = np.array([[cx - r, cy - r], [cx + r, cy - r],
+                                    [cx + r, cy + r], [cx - r, cy + r]])
+            det.side_confidence = [conf] * 4
+            det.confidence = conf
+            det.trim = [0, 0, 0, 0]
+            det.notes.append(f"Disc found: {2 * r:.0f} px across; everything outside it "
+                             "becomes white.")
+            return det
+        det.disc = None
     side_len = [np.hypot(*(coarse[(i + 1) % 4] - coarse[i])) for i in range(4)]
     radius = int(np.clip(0.02 * min(side_len), 16, 90))
 
@@ -431,31 +694,46 @@ def detect_cover(img: np.ndarray, fit_bow: bool = True) -> CoverDetection:
     conf = [0.0] * 4
     samples = [np.zeros((0, 2))] * 4
     lid = np.asarray(det.bg_color, np.float32)
+    moved = [False] * 4
+    flat_jump = [False] * 4
+    at_border = [False] * 4
     for _pass in range(2):
         center = corners.mean(axis=0)
         starts, ends = [], []       # tangent lines of each side at its two ends
         for i in range(4):
             a, b = corners[i], corners[(i + 1) % 4]
             t, n, length = _side_frame(a, b, center)
+            kept = _off_border_line(a, b, n, w, h, det.off_sides)
+            if kept is not None:
+                # the cover runs past this edge of the scan: keep the edge
+                starts.append(kept)
+                ends.append(kept)
+                conf[i], found[i], at_border[i] = 1.0, True, True
+                continue
             s, o, band = _sample_band(img_blur, a, t, n, length, radius)
             e = _pick_edges(band, o)
             fit = _fit_side(s, e)
-            suspicious = fit is None or fit[1] < 0.3 or _on_image_border(a, b, w, h)
-            if _pass == 0 and suspicious:
-                # The rough outline may be far outside the paper (lid
-                # differences counted as cover).  Look much further inward,
-                # but accept only a strong straight edge with nothing but
-                # plain lid between it and the rough line.
-                inner = int(min(0.15 * length, 600))
+            suspicious = fit is None or fit[1] < 0.5 or _on_image_border(a, b, w, h)
+            # Run in both passes: once neighbouring sides have been pulled in,
+            # a side's band no longer spans empty lid and its edge scores higher.
+            if suspicious and not moved[i]:
+                # The rough outline may be far outside the paper (lid shadow
+                # or a lid lifted by a booklet spine counted as cover).  Look
+                # much further inward, but accept only a strong straight edge
+                # with nothing but plain lid between it and the rough line.
+                inner = int(0.45 * min(side_len))
                 s2, o2, band2 = _sample_band(img_blur, a, t, n, length, radius, inner=inner)
                 e2 = _pick_edges(band2, o2)
                 fit2 = _fit_side(s2, e2)
-                if fit2 is not None and fit2[1] >= 0.6 \
-                        and (fit is None or fit2[1] >= fit[1] + 0.15):
+                if fit2 is not None and fit2[1] >= 0.4 \
+                        and (fit is None or fit2[1] >= fit[1] + 0.1):
                     move = float(np.polyval(fit2[0], length / 2))
                     if move < -0.5 * radius \
                             and _cut_looks_like_lid(band2, o2, s2, fit2[0], lid):
                         s, o, band, e, fit = s2, o2, band2, e2, fit2
+                        moved[i] = True
+                        # jumped across plain white: might be white paper margin
+                        flat_jump[i] = _cut_is_bright_lid(band2, o2, s2, fit2[0], lid)
                         det.notes.append(
                             f"{SIDE_NAMES[i]} edge found {-move:.0f} px inside the rough "
                             "outline (uneven scanner lid).")
@@ -478,6 +756,9 @@ def detect_cover(img: np.ndarray, fit_bow: bool = True) -> CoverDetection:
             p = _intersect(*ends[i - 1], *starts[i])
             new[i] = corners[i] if p is None else p
         corners = new
+    weak = [(not found[i]) or conf[i] < 0.3 or flat_jump[i] for i in range(4)]
+    if any(weak[i] and not at_border[i] for i in range(4)):
+        corners = _snap_to_standard(corners, conf, weak, dpi, det.notes)
     center = corners.mean(axis=0)
 
     # ---- bow (curved edges) and trim suggestions -------------------------
@@ -519,6 +800,9 @@ def detect_cover(img: np.ndarray, fit_bow: bool = True) -> CoverDetection:
         r = resid_all[i]
         inward = np.percentile(np.maximum(0.0, -r), 90) if len(r) else 0.0
         trim = int(np.ceil(2.0 + min(inward, 0.01 * min(side_len))))
+        if at_border[i]:
+            trims.append(0)               # the scan's own edge: nothing to trim
+            continue
         if found[i] and max_wear > 2:
             a, b = corners[i], corners[(i + 1) % 4]
             t, n, length = _side_frame(a, b, center)
@@ -595,15 +879,76 @@ def outline_points(corners, bow=None, per_side=40) -> np.ndarray:
     return np.concatenate(out)
 
 
+def text_angle(img: np.ndarray, disc: bool = False):
+    """Skew of straight text / line art, in degrees (-45..45), or None.
+
+    Projection-profile method: the image's edge map is rotated through
+    candidate angles and the angle at which its row sums are most uneven
+    (text lines and gaps lined up) wins.  Returns (angle, strength) where
+    strength is the winning score relative to the median over all angles.
+    Only the angle modulo 90 degrees can be found this way.
+    """
+    small = cv2.resize(img, None, fx=600.0 / max(img.shape[:2]), fy=600.0 / max(img.shape[:2]),
+                       interpolation=cv2.INTER_AREA)
+    g = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    edges = np.abs(cv2.Laplacian(cv2.GaussianBlur(g, (0, 0), 0.8), cv2.CV_32F))
+    h, w = edges.shape
+    if disc:
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        r = np.hypot(xx - (w - 1) / 2, yy - (h - 1) / 2) / (min(w, h) / 2)
+        edges *= ((r > 0.30) & (r < 0.92)).astype(np.float32)   # skip hub and rim
+    edges = np.minimum(edges, np.percentile(edges, 99.5) + 1e-6)
+
+    def score(a):
+        m = cv2.getRotationMatrix2D((w / 2, h / 2), a, 1.0)
+        rot = cv2.warpAffine(edges, m, (w, h), flags=cv2.INTER_LINEAR)
+        prof = rot.sum(axis=1)
+        return float(np.var(np.diff(prof)))
+
+    coarse = np.arange(-45.0, 45.0, 1.0)
+    sc = np.array([score(a) for a in coarse])
+    best = float(coarse[int(np.argmax(sc))])
+    fine = np.arange(best - 1.0, best + 1.01, 0.1)
+    sf = np.array([score(a) for a in fine])
+    angle = float(fine[int(np.argmax(sf))])
+    strength = float(sf.max() / (np.median(sc) + 1e-9))
+    return angle, strength
+
+
 def apply_geometry(img: np.ndarray, corners, bow=None, trim=(0, 0, 0, 0),
-                   rotate90: int = 0) -> np.ndarray:
-    """Rectify, trim and rotate. Returns a new float32 image."""
+                   rotate90: int = 0, disc: bool = False, angle: float = 0.0) -> np.ndarray:
+    """Rectify, trim and rotate. Returns a new float32 image.
+
+    With `disc`, the corners enclose a round disc: everything outside the
+    inscribed circle is set to white (with an anti-aliased rim).  `angle`
+    rotates the result by that many degrees (counter-clockwise) about its
+    centre; a disc keeps its full size, a rectangular cover is enlarged as
+    little as needed so no blank corners show.
+    """
     if corners is None:
         out = img
     else:
         mx, my = build_maps(corners, bow)
         out = cv2.remap(img, mx, my, cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
         out = np.clip(out, 0.0, 1.0)
+    if abs(angle) > 0.01:
+        h, w = out.shape[:2]
+        if disc:
+            zoom = 1.0
+        else:                                        # crop rotated corners away
+            rad = np.radians(abs(angle))
+            zoom = float(np.cos(rad) + max(w, h) / min(w, h) * np.sin(rad))
+        m = cv2.getRotationMatrix2D(((w - 1) / 2, (h - 1) / 2), angle, zoom)
+        out = cv2.warpAffine(out, m, (w, h), flags=cv2.INTER_LANCZOS4,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=(1.0, 1.0, 1.0))
+        out = np.clip(out, 0.0, 1.0)
+    if corners is not None:
+        if disc:
+            h, w = out.shape[:2]
+            yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+            dist = np.hypot(xx - (w - 1) / 2, yy - (h - 1) / 2)
+            inside = np.clip((min(w, h) - 1) / 2 - dist + 0.5, 0.0, 1.0)[:, :, None]
+            out = out * inside + (1.0 - inside)
     l, t, r, b = [max(0, int(x)) for x in trim]
     h, w = out.shape[:2]
     if l + r < w - 8 and t + b < h - 8 and (l or t or r or b):

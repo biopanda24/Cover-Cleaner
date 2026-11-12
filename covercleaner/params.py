@@ -24,6 +24,8 @@ class GeometryParams:
     # Extra pixels removed after rectification: left, top, right, bottom.
     trim: list = field(default_factory=lambda: [0, 0, 0, 0])
     rotate90: int = 0  # number of clockwise quarter turns
+    disc: bool = False  # round disc: white outside the inscribed circle
+    angle: float = 0.0  # fine rotation, degrees counter-clockwise
 
 
 @dataclass

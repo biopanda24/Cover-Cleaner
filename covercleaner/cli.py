@@ -14,7 +14,7 @@ import time
 
 from . import ml
 from .auto import auto_params
-from .imageio import SUPPORTED, load_image, save_image
+from .imageio import SUPPORTED, load_image, read_dpi, save_image
 from .params import Params
 from .pipeline import Pipeline
 
@@ -92,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
             src = load_image(path)
             pipe = Pipeline(src)
             mode = args.pipeline or ("ml" if ml.available() else "traditional")
-            params, report = auto_params(src, pipeline=pipe, mode=mode)
+            params, report = auto_params(src, pipeline=pipe, mode=mode, dpi=read_dpi(path))
             params.output.scale = args.scale
             for line in report:
                 print("   " + line)
