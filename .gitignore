@@ -7,3 +7,4 @@ output/
 *.egg-info/
 .pytest_cache/
 models/
+References/

@@ -46,7 +46,7 @@ def auto_params(source: np.ndarray, progress: Progress = None,
         g.enabled = True
         g.corners = [[float(x), float(y)] for x, y in det.corners]
         g.bow = [[float(v) for v in row] for row in det.bow]
-        g.use_bow = det.max_bow >= 1.5
+        g.use_bow = False      # covers are scanned flat: no bending
         g.trim = [int(t) for t in det.trim]
         g.disc = det.disc is not None
         w, h = geometry.output_size(det.corners)

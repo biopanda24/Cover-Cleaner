@@ -99,7 +99,7 @@ def test_curved_edge_is_straightened():
     fall = np.clip(1 - (yy - 140) / 450, 0, 1)
     bent = cv2.remap(scan, xx, yy - 6 * 4 * t * (1 - t) * fall, cv2.INTER_LINEAR,
                      borderMode=cv2.BORDER_REPLICATE)
-    det = geometry.detect_cover(bent)
+    det = geometry.detect_cover(bent, fit_bow=True)
     assert 3.5 < det.max_bow < 9, det.max_bow
     assert np.abs(det.bow[0]).max() == pytest.approx(det.max_bow)
 

@@ -159,7 +159,9 @@ def _coarse_rect(img: np.ndarray, det: CoverDetection):
             best = max(best, cur)
         return best / max(1, len(hit))
 
-    strips = _border_strips(dist, m)
+    # only the outermost pixels: a cover lying close to the edge of the scan
+    # must not count as running past it
+    strips = _border_strips(dist, 2)
     off = tuple(k for k, v in strips.items()
                 if covered_run(v, 0 if k in ("top", "bottom") else 1) > 0.2)
     if 0 < len(off) <= 2 and set(off) not in ({"top", "bottom"}, {"left", "right"}):
@@ -260,7 +262,7 @@ def _sample_band(img_blur, a, t, n, length, radius, step=2.0, margin=0.03, inner
 SHARP_NEAR = 4      # px either side over which a paper edge must show its step
 
 
-def _pick_edges(band: np.ndarray, o: np.ndarray):
+def _pick_edges(band: np.ndarray, o: np.ndarray, sens: float = 1.0):
     """Locate the paper edge in every row of a band. Returns offsets (nan = none).
 
     The paper edge is the outermost *sharp* transition.  Lid shadows and a
@@ -281,8 +283,8 @@ def _pick_edges(band: np.ndarray, o: np.ndarray):
     g = np.where(dl >= 0, mag, -mag)                     # signed colour gradient
     outer = g[:, : max(4, g.shape[1] // 4)]
     noise = 1.4826 * np.median(np.abs(outer - np.median(outer)))
-    thr = max(6.0 * noise, 0.010)
-    min_step = max(0.02, 2.0 * thr)
+    thr = max(6.0 * noise, 0.010) / sens
+    min_step = max(0.02 / sens, 2.0 * thr)
     out = np.full(g.shape[0], np.nan)
     ncol = g.shape[1]
     cs = np.concatenate([np.zeros((band.shape[0], 1, 3), np.float64),
@@ -445,6 +447,63 @@ def _fit_side(s, e):
 LID_TEXTURE = 0.004     # high-frequency level: bare lid < ~0.0025, print > ~0.005
 
 
+def _tint_edge(band: np.ndarray, o: np.ndarray, s: np.ndarray, chunks: int = 12):
+    """Find a paper edge by colour, ignoring brightness.
+
+    The lid is neutral grey however it is shaded (a lid lifted by a booklet
+    spine fades from white to grey over hundreds of pixels), while paper -
+    even "white" cover stock - has a tint.  The band is averaged along the
+    side in chunks; in each, brightness is removed (each colour minus the
+    pixel's mean) and the outermost point from which the colour stays away
+    from the lid's for 15 px is taken.  The chunks must agree on a straight
+    line.  Returns (coef, confidence) like _fit_side, or None.
+    """
+    rows = band.shape[0]
+    if rows < chunks * 4:
+        return None
+    ps, pe = [], []
+    for k in range(chunks):
+        r0, r1 = k * rows // chunks, (k + 1) * rows // chunks
+        seg = band[r0:r1].mean(axis=0)                       # (cols, 3)
+        tint = seg - seg.mean(axis=1, keepdims=True)
+        tint = cv2.GaussianBlur(tint[None].astype(np.float32), (0, 0), 1.5)[0]
+        lid = np.median(tint[:24], axis=0)
+        dev = np.abs(tint - lid).max(axis=1)
+        far = dev > 0.02                                      # ~5 levels of tint
+        run = np.convolve(far.astype(np.int32), np.ones(15, np.int32), "valid") == 15
+        idx = np.flatnonzero(run)
+        if idx.size == 0 or idx[0] < 4:
+            continue
+        i = int(idx[0])
+        plateau = float(np.median(dev[i + 5:i + 15]))
+        j = i
+        while j > 0 and dev[j - 1] > 0.5 * plateau:           # back to the half-way point
+            j -= 1
+        ps.append(float(s[(r0 + r1) // 2]))
+        pe.append(float(o[j]))
+    if len(ps) < 0.7 * chunks:
+        return None
+    ps, pe = np.array(ps), np.array(pe)
+    best = None
+    for i in range(len(ps)):                                  # robust: try each pair
+        for j in range(i + 1, len(ps)):
+            if ps[j] == ps[i]:
+                continue
+            k_ = (pe[j] - pe[i]) / (ps[j] - ps[i])
+            if abs(k_) > 0.03:
+                continue
+            inl = np.abs(pe - (pe[i] + k_ * (ps - ps[i]))) < 6.0
+            if best is None or inl.sum() > best.sum():
+                best = inl
+    if best is None or best.sum() < 0.55 * chunks:
+        return None
+    coef = np.polyfit(ps[best], pe[best], 1)
+    full = np.zeros(3)
+    full[1:] = coef
+    # confidence scaled so a clear majority of chunks (55 %) passes the 0.7 bar
+    return full, min(1.0, float(best.sum()) / chunks / 0.55 * 0.7)
+
+
 def _faint_edge(band: np.ndarray, o: np.ndarray, s: np.ndarray, chunks: int = 10):
     """Find a faint but straight paper edge (white paper on a white lid).
 
@@ -582,6 +641,28 @@ def edge_wear(img_blur, a, t, n, length, max_depth):
     return best
 
 
+def _margin_edge(band, o, s, coef, length):
+    """A weaker straight paper edge outside an edge found further in.
+
+    White cover stock is often as bright as the lid, so the first clear edge
+    can be printing with a white paper margin outside it.  Look between the
+    outside and that edge at double sensitivity for a straight edge of its
+    own (the paper meeting the lid).  Returns (coef, confidence, picks) or
+    None.
+    """
+    stop = float(np.polyval(coef, length / 2)) + 10
+    keep = o >= stop
+    if keep.sum() <= 20:
+        return None
+    e = np.full(len(s), np.nan)
+    sub = _pick_edges(band[:, keep], o[keep], sens=2.0)
+    e[:] = sub
+    fit = _fit_side(s, e)
+    if fit is None or fit[1] < 0.35:
+        return None
+    return fit[0], fit[1], e
+
+
 def _cut_is_bright_lid(band, o, s, coef, lid_colour) -> bool:
     """The cut-away region is indistinguishable from bright, even lid (as
     opposed to a darker, shaded part of the lid)."""
@@ -660,7 +741,92 @@ def _snap_to_standard(corners, conf, weak, dpi, notes):
     return c
 
 
-def detect_cover(img: np.ndarray, fit_bow: bool = True, dpi: float | None = None) -> CoverDetection:
+RIM_MAX = 45      # px: thin rims outside the print are always cropped off
+UNDER_MAX = 85    # px: wider bands only when clearly a separate object
+
+
+def _under_element(img_blur, a, t, n, length, lid_colour):
+    """Width of a band to crop off between this side's edge and the print.
+
+    The cleanest crop follows the edge of the printed area.  Outside it,
+    along a side, there is often a thin smooth band: the white core of the
+    cut card, a dark lid shadow, or the edge of a booklet or tray card lying
+    under the jacket.  If a straight, consistent edge lies within RIM_MAX px
+    inside, with a smooth (unprinted) band outside it, the crop moves to it.
+    Wider bands (up to UNDER_MAX) are only cropped when they are clearly a
+    separate object under the jacket: darker than white paper and not
+    parallel to it (a printed border has an exactly constant width; a white
+    paper margin is kept).
+    Returns the inward shift (px), or 0.
+    """
+    s, o, band = _sample_band(img_blur, a, t, n, length, 6, inner=UNDER_MAX + 5)
+    keep = o <= -4
+    if keep.sum() < 20:
+        return 0.0
+    e = _pick_edges(band[:, keep], o[keep])
+    fit = _fit_side(s, e)
+    if fit is None or fit[1] < 0.6:
+        return 0.0
+    inner = np.polyval(fit[0], s)                         # offsets, negative
+    width = -inner
+    w = float(np.median(width))
+    if not (4 <= w <= UNDER_MAX):
+        return 0.0
+    region = (o[None, :] < -1) & (o[None, :] > inner[:, None] + 2)
+    if region.sum() < 50:
+        return 0.0
+    tex = np.abs(band - cv2.GaussianBlur(band, (1, 5), 1.0)).max(axis=2)
+    if float(tex[region].mean()) > 0.0075:                 # printed: part of the cover
+        return 0.0
+    vals = band[region]
+    lum = float(np.median(vals.mean(axis=1)))
+    chroma = float(np.median(vals.max(axis=1) - vals.min(axis=1)))
+    white = lum > float(lid_colour.mean()) - 0.06
+    spread = float(np.percentile(width, 90) - np.percentile(width, 10))
+    separate = spread >= 4.0             # not parallel: a different object
+    if w <= RIM_MAX:
+        if white:
+            return w if w <= 15 else 0.0                   # cut card core / paper margin
+        if w <= 20 or chroma < 0.06 or separate:           # shadow line / something underneath
+            return w
+        return 0.0                                         # coloured, parallel: printed border
+    if white or not separate:                              # paper margin / printed border
+        return 0.0
+    return w
+
+
+def _square_up(corners: np.ndarray, conf) -> np.ndarray:
+    """Turn the four fitted sides into a true rotated rectangle.
+
+    Covers are rectangles scanned flat, so the outline must not be warped
+    by perspective.  One common angle is taken from the side directions
+    (weighted by confidence and length, folded to -45..45 degrees); every
+    side keeps its own position (through its midpoint).
+    """
+    c = np.asarray(corners, np.float64)
+    angs, wts = [], []
+    for i in range(4):
+        d = c[(i + 1) % 4] - c[i]
+        ang = np.degrees(np.arctan2(d[1], d[0])) - 90.0 * i     # side i runs at 90*i
+        ang = (ang + 45.0) % 90.0 - 45.0
+        angs.append(ang)
+        wts.append(max(conf[i], 0.02) * np.hypot(*d))
+    angs = np.array(angs)
+    ref = angs[int(np.argmax(wts))]
+    angs = ref + ((angs - ref + 45.0) % 90.0 - 45.0)            # unwrap near the best
+    theta = np.radians(float(np.average(angs, weights=wts)))
+    u = np.array([np.cos(theta), np.sin(theta)])                # along the top
+    v = np.array([-np.sin(theta), np.cos(theta)])               # down the left side
+    mids = [(c[i] + c[(i + 1) % 4]) / 2 for i in range(4)]
+    lines = [(mids[0], u), (mids[1], v), (mids[2], u), (mids[3], v)]
+    out = np.zeros((4, 2))
+    for i in range(4):
+        p = _intersect(*lines[i - 1], *lines[i])
+        out[i] = c[i] if p is None else p
+    return out
+
+
+def detect_cover(img: np.ndarray, fit_bow: bool = False, dpi: float | None = None) -> CoverDetection:
     """Locate the cover in a scan. `img` is float32 BGR 0..1."""
     h, w = img.shape[:2]
     det = CoverDetection(corners=full_corners(img.shape),
@@ -743,14 +909,37 @@ def detect_cover(img: np.ndarray, fit_bow: bool = True, dpi: float | None = None
                         moved[i] = True
                         # jumped across plain white: might be white paper margin
                         flat_jump[i] = _cut_is_bright_lid(band2, o2, s2, fit2[0], lid)
+                        margin = _margin_edge(band2, o2, s2, fit2[0], length)
+                        if margin is not None:
+                            coef_m, conf_m, e_m = margin
+                            fit = (coef_m, max(conf_m, 0.5), np.isfinite(e_m) &
+                                   (np.abs(e_m - np.polyval(coef_m, s2)) < 1.5))
+                            e = e_m
+                            flat_jump[i] = False
+                            move = float(np.polyval(coef_m, length / 2))
                         det.notes.append(
                             f"{SIDE_NAMES[i]} edge found {-move:.0f} px inside the rough "
                             "outline (uneven scanner lid).")
             if fit is None:
                 # last resort: a faint but straight edge (white on white)
-                inner = int(0.25 * min(side_len))
+                inner = int(0.45 * min(side_len))
                 s3, o3, band3 = _sample_band(img_blur, a, t, n, length, radius, inner=inner)
                 faint = _faint_edge(band3, o3, s3)
+                if faint is None or faint[1] < 0.7:
+                    # paper tint against the neutral lid (soft, shaded edges)
+                    faint = _tint_edge(band3, o3, s3)
+                    if faint is not None and not _cut_looks_like_lid(band3, o3, s3, faint[0], lid):
+                        faint = None
+                    if faint is not None:
+                        # an untinted (white) margin may lie outside the tint
+                        # edge: prefer a weaker straight paper edge before it
+                        stop = float(np.polyval(faint[0], length / 2)) + 10
+                        keep = o3 >= stop
+                        if keep.sum() > 20:
+                            e4 = _pick_edges(band3[:, keep], o3[keep], sens=2.0)
+                            fit4 = _fit_side(s3, e4)
+                            if fit4 is not None and fit4[1] >= 0.35:
+                                faint = (fit4[0], max(fit4[1], 0.7))
                 if faint is not None and faint[1] >= 0.7:
                     coef = faint[0]
                     for sv, store in ((0.0, starts), (length, ends)):
@@ -800,6 +989,24 @@ def detect_cover(img: np.ndarray, fit_bow: bool = True, dpi: float | None = None
             p = _intersect(*ends[i - 1], *starts[i])
             new[i] = corners[i] if p is None else p
         corners = new
+    corners = _square_up(corners, conf)
+    # items lying under the jacket and sticking out past its edge
+    center = corners.mean(axis=0)
+    moved_under = []
+    for i in range(4):
+        if at_border[i] or not found[i]:
+            continue
+        a, b = corners[i], corners[(i + 1) % 4]
+        t, n, length = _side_frame(a, b, center)
+        shift = _under_element(img_blur, a, t, n, length, lid)
+        if shift > 0:
+            corners[i] = corners[i] - n * shift
+            corners[(i + 1) % 4] = corners[(i + 1) % 4] - n * shift
+            moved_under.append(f"{SIDE_NAMES[i]} {shift:.0f} px")
+    if moved_under:
+        corners = _square_up(corners, conf)
+        det.notes.append("Cropped to the edge of the print, past a thin rim or something "
+                         "under the jacket: " + ", ".join(moved_under) + ".")
     weak = [(not found[i]) or conf[i] < 0.3 or flat_jump[i] for i in range(4)]
     if any(weak[i] and not at_border[i] for i in range(4)):
         corners = _snap_to_standard(corners, conf, weak, dpi, det.notes)
