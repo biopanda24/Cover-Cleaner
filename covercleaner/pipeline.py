@@ -2,8 +2,8 @@
 
 Stage order (each works on the output of the previous one):
 
-    geometry -> descreen -> shading -> defects -> denoise -> tone
-             -> sharpen -> output
+    geometry -> descreen -> shading -> defects -> flat -> denoise
+             -> tone -> sharpen -> output
 
 Every stage result is cached together with a key built from the parameters
 of that stage and all stages before it, so changing e.g. the saturation only
@@ -18,12 +18,14 @@ import numpy as np
 
 from . import defects as _defects
 from . import descreen as _descreen
+from . import flat as _flat
 from . import geometry as _geometry
 from . import shading as _shading
 from . import tone as _tone
 from .params import Params, stage_key
 
-STAGES = ("geometry", "descreen", "shading", "defects", "denoise", "tone", "sharpen", "output")
+STAGES = ("geometry", "descreen", "shading", "defects", "flat", "denoise", "tone", "sharpen",
+          "output")
 Progress = Optional[Callable[[str, float], None]]
 
 
@@ -36,6 +38,7 @@ class Pipeline:
         self.protect_mask: Optional[np.ndarray] = None   # never touch these
         self._mask_version = 0
         self.defect_mask: Optional[np.ndarray] = None    # last mask actually used
+        self.flat_mask: Optional[np.ndarray] = None      # pixels evened out by 'flat'
 
     # ---- user masks ------------------------------------------------------
     def masks_changed(self) -> None:
@@ -92,6 +95,16 @@ class Pipeline:
         self.defect_mask = mask
         return _defects.inpaint(out, mask) if mask.any() else out
 
+    def _flat(self, img, p: Params):
+        f = p.flat
+        if not f.enabled:
+            self.flat_mask = None
+            return img
+        out, self.flat_mask = _flat.flatten(
+            img, f.tolerance, f.min_area, f.strength, f.unify, f.crisp_only,
+            f.fill_marks, f.pure_bw, f.clean_edges, protect=self.protect_mask)
+        return out
+
     def _denoise(self, img, p: Params):
         d = p.denoise
         return _tone.denoise(img, d.strength, d.chroma) if d.enabled else img
@@ -115,7 +128,7 @@ class Pipeline:
         if name == "output":
             return str(p.output.scale)
         key = stage_key(getattr(p, name))
-        if name == "defects":
+        if name in ("defects", "flat"):
             key += f"|masks{self._mask_version}"
         return key
 

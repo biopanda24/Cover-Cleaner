@@ -120,6 +120,18 @@ GROUPS = [
       ("glare_sensitivity", "Glare sensitivity", 0, 1, 2, ""),
       ("glare_strength", "Glare strength", 0, 1.5, 2, "")],
      [("dust_dark", "Dark specks"), ("dust_bright", "Light specks"), ("glare", "Glare")]),
+    ("flat", "Flat colour cleanup",
+     "Paints areas that were one solid colour in the artwork (backgrounds, stripes, "
+     "lettering) with a single even colour. Use the Protect brush to exclude a spot.",
+     [("tolerance", "Tolerance", 0.01, 0.2, 3, "How uneven an area may be and still count as "
+       "one flat colour. Raise it if blotchy areas are not evened out; lower it if "
+       "gradients or photos get flattened."),
+      ("min_area", "Min area %", 0.005, 1, 3, "Smallest area that can start a flat colour."),
+      ("strength", "Strength", 0, 1, 2, ""),
+      ("fill_marks", "Absorb marks %", 0, 2, 2, "Also paint over enclosed marks up to this "
+       "size (% of the short side). Beware: small print inside a flat area is a 'mark' too.")],
+     [("unify", "Unify colours"), ("crisp_only", "Artwork only"),
+      ("pure_bw", "Pure black/white"), ("clean_edges", "Clean edges")]),
     ("denoise", "Denoise", "Edge-preserving smoothing of scanner / paper grain.",
      [("strength", "Strength", 0, 1, 2, ""), ("chroma", "Colour noise", 0, 1, 2, "")], []),
     ("tone", "Tone and colour", "Restores ink black, paper white and colour.",
@@ -294,6 +306,10 @@ class MainWindow(QMainWindow):
                     self._widgets[(attr, name)] = cb
                     row.addWidget(cb)
                 lay.addLayout(row)
+            if attr == "flat":
+                self.show_flat = QCheckBox("Show flat areas (green)")
+                self.show_flat.toggled.connect(self._update_overlay)
+                lay.addWidget(self.show_flat)
             if attr == "shading":
                 row = QHBoxLayout()
                 self.side_checks = []
@@ -691,11 +707,16 @@ class MainWindow(QMainWindow):
         if self.view_mode != "result" or self.pipe is None or self.result is None:
             return
         brushing = self.brush_combo.currentIndex() > 0
-        if not (self.show_mask.isChecked() or brushing) or self.pipe.defect_mask is None:
+        layers = []
+        if self.show_flat.isChecked() and self.pipe.flat_mask is not None:
+            layers.append((self.pipe.flat_mask, (40, 220, 90)))
+        if (self.show_mask.isChecked() or brushing) and self.pipe.defect_mask is not None:
+            layers.append((self.pipe.defect_mask, (255, 40, 40)))
+            layers.append((self.pipe.protect_mask, (60, 120, 255)))
+        if not layers:
             self.view.set_overlay(None)
             return
-        layers = [(self.pipe.defect_mask, (255, 40, 40)), (self.pipe.protect_mask, (60, 120, 255))]
-        self.view.set_overlay(mask_pixmap(layers), self.params.output.scale)
+        self.view.set_overlay(mask_pixmap(layers, 120), self.params.output.scale)
 
     def _brush_changed(self, *_):
         idx = self.brush_combo.currentIndex()

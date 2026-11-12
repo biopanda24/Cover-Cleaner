@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 import pytest
 
-from covercleaner import defects, descreen, geometry, shading, tone
+from covercleaner import defects, descreen, flat, geometry, shading, tone
 from covercleaner.auto import auto_params
 from covercleaner.params import Params
 from covercleaner.pipeline import Pipeline
@@ -182,3 +182,48 @@ def test_params_roundtrip_and_cache():
     b = pipe.run(p)
     assert pipe.stage_output("geometry") is geo           # early stages reused
     assert not np.allclose(a, b)
+
+
+def _poster(size=700):
+    """Flat artwork: two colours, a dark logo, plus a smooth photo-like gradient."""
+    img = np.empty((size, size, 3), np.float32)
+    img[:] = (0.88, 0.74, 0.97)
+    cv2.rectangle(img, (120, 120), (480, 480), (0.93, 0.86, 0.98), -1)
+    _text(img, "LOGO", (135, 345), 3.6, 0.0, 26)
+    y = np.linspace(0, 1, 160, dtype=np.float32)[:, None]
+    img[520:680, 40:660] = 0.2 + 0.6 * y[:, :, None]            # gradient strip
+    img[:] = cv2.GaussianBlur(img, (0, 0), 0.8)
+    return img
+
+
+def test_flat_colour_cleanup_restores_solid_areas_and_keeps_gradients():
+    clean = _poster()
+    rng = np.random.default_rng(5)
+    blotch = cv2.GaussianBlur(rng.normal(0, 1, clean.shape[:2]).astype(np.float32), (0, 0), 25)
+    blotch = blotch / np.abs(blotch).max() * 0.035                # uneven scan / ink mottle
+    scan = clean + blotch[:, :, None] + rng.normal(0, 0.008, clean.shape).astype(np.float32)
+    scan = scan * 0.93 + 0.05                                     # grey blacks
+    scan = np.clip(scan, 0, 1).astype(np.float32)
+    res = flat.find_flat_regions(scan)
+    assert res.coverage > 0.5
+    out, mask = flat.flatten(scan, result=res)
+    bg = out[20:100, 20:680].reshape(-1, 3)
+    assert np.ptp(bg, axis=0).max() < 1e-4, "background is not one even colour"
+    assert np.ptp(out[150, 140:460], axis=0).max() < 1e-4         # inner panel too
+    letter = out[250:350, 150:470]
+    assert (letter.max(axis=2) < 0.01).mean() > 0.15, "logo not snapped to pure black"
+    grad = (slice(540, 660), slice(60, 640))
+    assert mask[grad].mean() < 5, "smooth gradient was flattened"
+    assert np.abs(out[grad] - scan[grad]).max() < 1e-6
+    # protected pixels are never changed
+    prot = np.zeros(scan.shape[:2], np.uint8)
+    prot[40:60, 40:60] = 255
+    out2, _ = flat.flatten(scan, result=res, protect=prot)
+    assert np.array_equal(out2[40:60, 40:60], scan[40:60, 40:60])
+
+
+def test_flat_cleanup_leaves_photos_alone():
+    rng = np.random.default_rng(2)
+    photo = cv2.GaussianBlur(rng.uniform(0, 1, (600, 600, 3)).astype(np.float32), (0, 0), 12)
+    photo = (photo - photo.min()) / (photo.max() - photo.min())
+    assert flat.find_flat_regions(photo).coverage < 0.05

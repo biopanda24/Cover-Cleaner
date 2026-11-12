@@ -11,7 +11,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from . import defects, descreen, geometry, shading, tone
+from . import defects, descreen, flat, geometry, shading, tone
 from .params import Params
 from .pipeline import Pipeline
 
@@ -110,7 +110,29 @@ def auto_params(source: np.ndarray, progress: Progress = None,
         report.append("Glare: none detected.")
     img = pipe.run(p, upto="defects")
 
-    # ---- 5. noise, tone, sharpening ----------------------------------------
+    # ---- 5. flat colour areas ----------------------------------------------
+    step("Looking for flat colour areas", 0.7)
+    fp = p.flat
+    fr = flat.find_flat_regions(img, fp.tolerance, fp.min_area, fp.unify, fp.crisp_only,
+                                fp.pure_bw)
+    main = [c for c in fr.palette if c[3] >= 0.01]
+    cols = ", ".join("%d,%d,%d" % (round(c[2] * 255), round(c[1] * 255), round(c[0] * 255))
+                     for c in main[:5])
+    # Only for covers that are mostly solid-colour artwork; a photo with a
+    # few even patches would be posterised.
+    if fr.coverage >= 0.5 and 1 <= len(main) <= 8:
+        fp.enabled = True
+        report.append(f"Flat colours: {fr.coverage * 100:.0f}% of the cover is solid colour "
+                      f"({len(main)} main colours, R,G,B: {cols}); evening out.")
+    elif fr.coverage >= 0.05:
+        report.append(f"Flat colours: {fr.coverage * 100:.0f}% looks like solid colour - not "
+                      "enough to be sure this is flat artwork. Enable 'Flat colour cleanup' "
+                      "if it is.")
+    else:
+        report.append("Flat colours: none found (photographic cover); skipped.")
+    img = pipe.run(p, upto="flat")
+
+    # ---- 6. noise, tone, sharpening ----------------------------------------
     step("Measuring tone and noise", 0.8)
     ta = tone.analyze_tone(img)
     if ta.noise > 0.006:

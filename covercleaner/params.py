@@ -62,6 +62,20 @@ class DefectParams:
 
 
 @dataclass
+class FlatParams:
+    """Even out areas that were one solid colour in the original artwork."""
+    enabled: bool = False
+    tolerance: float = 0.06   # how much a region may vary and still be "flat"
+    min_area: float = 0.05    # smallest region, % of the image area
+    strength: float = 1.0
+    unify: bool = True        # same colour everywhere -> one palette colour
+    crisp_only: bool = True   # only regions with crisp, artwork-like outlines
+    pure_bw: bool = True      # near-black -> black, near-white -> white
+    clean_edges: bool = True  # rebuild anti-aliased edges between flat areas
+    fill_marks: float = 0.0   # absorb enclosed marks up to this size (% short side)
+
+
+@dataclass
 class DenoiseParams:
     enabled: bool = False
     strength: float = 0.3     # 0..1
@@ -100,6 +114,7 @@ class Params:
     descreen: DescreenParams = field(default_factory=DescreenParams)
     shading: ShadingParams = field(default_factory=ShadingParams)
     defects: DefectParams = field(default_factory=DefectParams)
+    flat: FlatParams = field(default_factory=FlatParams)
     denoise: DenoiseParams = field(default_factory=DenoiseParams)
     tone: ToneParams = field(default_factory=ToneParams)
     sharpen: SharpenParams = field(default_factory=SharpenParams)
