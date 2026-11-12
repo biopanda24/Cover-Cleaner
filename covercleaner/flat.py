@@ -110,6 +110,36 @@ def find_flat_regions(img: np.ndarray, tolerance: float = 0.06, min_area_pct: fl
         frac = (crisp + 3.0 * on_edge) / np.maximum(total + 3.0 * on_edge, 1.0)
         ok &= frac >= 0.20
 
+    # A flat area is bounded by an edge: just outside it the colour changes.
+    # A pocket of a larger textured or grainy area (dark hair, shadows in a
+    # photo) is surrounded by more of the same tone; flattening it would
+    # leave a visible blotch, so such regions are dropped.
+    cand_ids = np.flatnonzero(ok | small)
+    if cand_ids.size:
+        stats = cv2.connectedComponentsWithStats((labels > 0).astype(np.uint8), 4)[2] \
+            if False else None
+        ys, xs = np.nonzero(np.isin(labels, cand_ids))
+        lab_of = labels[ys, xs]
+        x0 = np.full(n, 1 << 30); y0 = np.full(n, 1 << 30); x1 = np.zeros(n, int); y1 = np.zeros(n, int)
+        np.minimum.at(x0, lab_of, xs); np.minimum.at(y0, lab_of, ys)
+        np.maximum.at(x1, lab_of, xs); np.maximum.at(y1, lab_of, ys)
+        k_in = np.ones((13, 13), np.uint8)       # region stops ~4-5 px short of its edge,
+        k_out = np.ones((25, 25), np.uint8)      # so look 7-12 px out, past the edge
+        for i in cand_ids:
+            pad = 13
+            sy0, sx0 = max(0, y0[i] - pad), max(0, x0[i] - pad)
+            sy1, sx1 = min(h, y1[i] + pad + 1), min(w, x1[i] + pad + 1)
+            reg = (labels[sy0:sy1, sx0:sx1] == i).astype(np.uint8)
+            ring = (cv2.dilate(reg, k_out) > 0) & (cv2.dilate(reg, k_in) == 0)
+            others = (labels[sy0:sy1, sx0:sx1] > 0) & ~reg.astype(bool)
+            ring &= ~others                                  # neighbours that are flat themselves
+            if ring.sum() < 20:
+                continue
+            d = np.abs(smooth[sy0:sy1, sx0:sx1][ring] - mean[i]).max(axis=1)
+            if float((d < tol).mean()) > 0.5:
+                ok[i] = False
+                small[i] = False
+
     if not ok.any():
         return empty
 
@@ -246,10 +276,26 @@ def flatten(img: np.ndarray, tolerance: float = 0.06, min_area_pct: float = 0.05
             hi, lo = around(labels.astype(np.float32))
     inside = labels > 0
     st = float(min(strength, 1.0))
-    target = res.colours[labels]
-    out = img.copy()
-    out[inside] = img[inside] + st * (target[inside] - img[inside])
-    mask = inside.astype(np.uint8) * 255
+    # Blend by closeness: a pixel near a region's colour (as scanned) becomes
+    # the flat colour; one further off - grain or detail - is changed less,
+    # fading out at the tolerance.  Pixels up to REACH px outside a region
+    # (pockets the region test skipped, e.g. next to a stray hair) are
+    # treated the same way, fading with distance, so a region never shows
+    # as a block of flat colour among same-toned unflattened pixels.
+    REACH = 12.0
+    near_lab = labels.copy()
+    if (~inside).any():
+        grown = cv2.dilate(labels.astype(np.float32), np.ones((25, 25), np.uint8)).astype(np.int32)
+        near_lab[~inside] = grown[~inside]
+    dist = cv2.distanceTransform((~inside).astype(np.uint8), cv2.DIST_L2, 3)
+    prox = np.clip(1.0 - dist / REACH, 0.0, 1.0) * (near_lab > 0)
+    seen = res.observed[near_lab]
+    target = res.colours[near_lab]
+    d = np.abs(cv2.GaussianBlur(img, (0, 0), 1.2) - seen).max(axis=2)
+    close = np.clip((tolerance - d) / (0.5 * tolerance), 0.0, 1.0)
+    wgt = cv2.GaussianBlur((close * prox).astype(np.float32), (0, 0), 1.0) * (near_lab > 0)
+    out = img + (st * wgt)[:, :, None] * (target - img)
+    mask = (wgt > 0.5).astype(np.uint8) * 255
     if clean_edges:
         # Pixels on the seam between two flat regions are a blend of their
         # two colours (anti-aliasing) plus noise.  Re-create the blend from
