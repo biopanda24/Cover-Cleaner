@@ -56,18 +56,28 @@ class AppSettings:
             return stored
         return self.fallback_dpi if self.fallback_dpi and self.fallback_dpi > 0 else None
 
-    def output_path(self, src: str, folder: str | None = None) -> str:
-        """Where the result of `src` is saved under these options."""
-        folder = folder or self.save_dir or os.path.join(os.path.dirname(os.path.abspath(src)),
-                                                         "restored")
+    def output_path(self, src: str, folder: str | None = None, taken: set | None = None) -> str:
+        """Where the result of `src` is saved under these options.
+
+        Never in the scan's own folder (a 'restored' folder inside it is used
+        instead), so an original can never be overwritten.  `taken` collects
+        the names already given out in this batch: two scans with the same
+        name (a.png and a.tif, or front.png from two folders) get different
+        files even when they are written at the same time.
+        """
+        folder = os.path.abspath(folder or self.save_dir or
+                                 os.path.join(os.path.dirname(os.path.abspath(src)), "restored"))
+        if os.path.normcase(folder) == os.path.normcase(os.path.dirname(os.path.abspath(src))):
+            folder = os.path.join(folder, "restored")
         base = os.path.splitext(os.path.basename(src))[0] + self.suffix
+        taken = taken if taken is not None else set()
         path = os.path.join(folder, f"{base}.{self.format}")
-        if self.overwrite:
-            return path
         k = 2
-        while os.path.exists(path):
+        while (os.path.normcase(path) in taken
+               or (not self.overwrite and os.path.exists(path))):
             path = os.path.join(folder, f"{base} ({k}).{self.format}")
             k += 1
+        taken.add(os.path.normcase(path))
         return path
 
     def to_dict(self) -> dict:
@@ -75,24 +85,64 @@ class AppSettings:
 
     @classmethod
     def from_dict(cls, d: dict) -> "AppSettings":
+        """Read stored options field by field: a missing or unreadable value
+        (hand-edited, from an older version) keeps its default instead of
+        resetting everything."""
         s = cls()
+        if not isinstance(d, dict):
+            return s
         for f in fields(cls):
-            if f.name not in d:
+            if f.name not in d or d[f.name] is None:
                 continue
             if f.name == "rules":
                 r = AutoRules()
-                for rf in fields(AutoRules):
-                    if rf.name in (d["rules"] or {}):
-                        setattr(r, rf.name, bool(d["rules"][rf.name]))
+                if isinstance(d["rules"], dict):
+                    for rf in fields(AutoRules):
+                        v = _as_bool(d["rules"].get(rf.name))
+                        if v is not None:
+                            setattr(r, rf.name, v)
                 s.rules = r
-            else:
-                setattr(s, f.name, type(getattr(s, f.name))(d[f.name]))
+                continue
+            v = _coerce(d[f.name], getattr(s, f.name))
+            if v is not None:
+                setattr(s, f.name, v)
         if s.format not in FORMATS:
             s.format = "png"
         if s.pipeline not in PIPELINES:
             s.pipeline = "auto"
         s.bits = 16 if s.bits == 16 else 8
+        s.jpeg_quality = int(min(100, max(1, s.jpeg_quality)))
+        s.scale = float(min(4.0, max(0.05, s.scale)))
+        s.jobs = max(0, s.jobs)
+        s.fallback_dpi = max(0.0, s.fallback_dpi)
         return s
+
+
+def _as_bool(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str) and v.strip().lower() in ("true", "yes", "on", "1", "false", "no", "off", "0"):
+        return v.strip().lower() in ("true", "yes", "on", "1")
+    return None
+
+
+def _coerce(v, default):
+    """`v` converted to the type of `default`, or None if it cannot be."""
+    try:
+        if isinstance(default, bool):
+            return _as_bool(v)
+        if isinstance(default, int):
+            return int(float(v))
+        if isinstance(default, float):
+            x = float(v)
+            return x if x == x else None          # not NaN
+        if isinstance(default, str):
+            return v if isinstance(v, str) else None
+    except (TypeError, ValueError):
+        return None
+    return None
 
 
 def settings_path() -> str:
@@ -108,7 +158,7 @@ def load() -> AppSettings:
     try:
         with open(settings_path(), encoding="utf8") as fh:
             return AppSettings.from_dict(json.load(fh))
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, AttributeError):
         return AppSettings()
 
 

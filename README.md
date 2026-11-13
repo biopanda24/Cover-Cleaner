@@ -100,7 +100,7 @@ command line, whose flags override them for one run (`--format`, `--bits`,
 `--[no-]flat`, `--dpi`, `-j`).
 
 * **Output:** default save location (a `restored` folder next to the
-  scans unless set), format, bit depth, JPEG quality, file name suffix,
+  scans unless set; results are never written into a scans folder itself), format, bit depth, JPEG quality, file name suffix,
   overwrite or number new files (`name (2).png`), save the chosen settings
   (.json) with each result, output scale.
 * **Processing:** default pipeline (automatic / ML / Traditional), use the

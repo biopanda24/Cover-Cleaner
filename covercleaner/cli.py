@@ -66,8 +66,11 @@ def _worker_init(threads: int) -> None:
     cv2.setNumThreads(threads)
 
 
-def _auto_one(path: str, opts: dict) -> tuple[str, bool]:
-    """Analyse and restore one scan. Returns (report text, ok)."""
+IMAGE_EXTS = (".png", ".tif", ".tiff", ".jpg", ".jpeg")
+
+
+def _auto_one(path: str, dst: str | None, opts: dict) -> tuple[str, bool]:
+    """Analyse and restore one scan into `dst`. Returns (report text, ok)."""
     from . import settings as _settings
     t0 = time.time()
     st = _settings.AppSettings.from_dict(opts["settings"])
@@ -80,14 +83,9 @@ def _auto_one(path: str, opts: dict) -> tuple[str, bool]:
                                      dpi=st.dpi_for(read_dpi(path)), flat_cleaner=st.flat_cleaner,
                                      rules=st.rules, scale=st.scale)
         lines += ["   " + line for line in report]
-        if opts.get("analyze_only"):
+        if opts.get("analyze_only") or not dst:
             return "\n".join(lines), True
         result = pipe.run(params)
-        out = opts.get("output")
-        if out and not opts.get("many") and os.path.splitext(out)[1]:
-            dst = out                                   # a single file named on the command line
-        else:
-            dst = st.output_path(path, out or None)
         save_image(dst, result, st.bits, st.jpeg_quality)
         if st.save_params:
             with open(os.path.splitext(dst)[0] + ".json", "w", encoding="utf8") as fh:
@@ -100,40 +98,70 @@ def _auto_one(path: str, opts: dict) -> tuple[str, bool]:
         return "\n".join(lines), False
 
 
+def plan_outputs(files: list[str], st, output: str | None = None,
+                 output_is_dir: bool = False) -> dict:
+    """Output file for each scan, all different and none over an original.
+
+    `output` is a folder - or, for a single scan on the command line, a file
+    name when it ends in an image extension and is not an existing folder.
+    """
+    if (output and len(files) == 1 and not output_is_dir and not os.path.isdir(output)
+            and os.path.splitext(output)[1].lower() in IMAGE_EXTS):
+        dst = os.path.abspath(output)
+        if os.path.normcase(dst) == os.path.normcase(os.path.abspath(files[0])):
+            raise ValueError(f"refusing to overwrite the scan itself: {dst}")
+        return {files[0]: dst}
+    taken: set = set()
+    return {f: st.output_path(f, output, taken) for f in files}
+
+
 def run_batch(files: list[str], st, output: str | None = None, analyze_only: bool = False,
-              emit=print, progress=None) -> int:
+              emit=print, progress=None, output_is_dir: bool = False) -> int:
     """Run Auto on `files` with options `st` (AppSettings); returns the number
     that failed.  `emit` receives each scan's report as it finishes,
     `progress(done, total)` the count."""
+    from concurrent.futures.process import BrokenProcessPool
     ml.set_use_gpu(st.use_gpu)
-    opts = dict(settings=st.to_dict(), output=output, many=len(files) > 1,
-                analyze_only=analyze_only)
+    opts = dict(settings=st.to_dict(), analyze_only=analyze_only)
+    dsts = {} if analyze_only else plan_outputs(files, st, output, output_is_dir)
     mode = st.mode(ml.available())
-    jobs = st.jobs if st.jobs > 0 else default_jobs(len(files), mode == "ml" and ml.gpu_usable())
+    use_gpu = mode == "ml" and ml.gpu_usable()
+    jobs = st.jobs if st.jobs > 0 else default_jobs(len(files), use_gpu)
     jobs = max(1, min(jobs, len(files)))
+    if use_gpu and jobs > 1:
+        ml.prepare_gpu_model()            # convert once here, not in every worker
     t_start = time.time()
     failed = 0
+    done = 0
+    retry: list[str] = []
+
+    def report(text, ok):
+        nonlocal failed, done
+        done += 1
+        emit(f"[{done}/{len(files)}] " + text if len(files) > 1 else text)
+        failed += not ok
+        if progress:
+            progress(done, len(files))
+
     if jobs == 1:
-        for k, path in enumerate(files, 1):
-            text, ok = _auto_one(path, opts)
-            emit(f"[{k}/{len(files)}] " + text if len(files) > 1 else text)
-            failed += not ok
-            if progress:
-                progress(k, len(files))
+        for path in files:
+            report(*_auto_one(path, dsts.get(path), opts))
     else:
         threads = max(1, (os.cpu_count() or 1) // jobs)
         emit(f"Processing {len(files)} scans, {jobs} at a time.")
         with ProcessPoolExecutor(jobs, initializer=_worker_init, initargs=(threads,)) as ex:
-            futures = {ex.submit(_auto_one, path, opts): path for path in files}
-            for done, fut in enumerate(as_completed(futures), 1):
+            futures = {ex.submit(_auto_one, path, dsts.get(path), opts): path for path in files}
+            for fut in as_completed(futures):
                 try:
-                    text, ok = fut.result()
-                except Exception as exc:          # a worker died (e.g. out of memory)
-                    text, ok = f"== {futures[fut]}\n   FAILED: {exc}", False
-                emit(f"[{done}/{len(files)}] " + text)
-                failed += not ok
-                if progress:
-                    progress(done, len(files))
+                    report(*fut.result())
+                except BrokenProcessPool:         # a worker died (e.g. out of memory)
+                    retry.append(futures[fut])
+                except Exception as exc:
+                    report(f"== {futures[fut]}\n   FAILED: {exc}", False)
+        if retry:
+            emit(f"A worker stopped unexpectedly; retrying {len(retry)} scans one at a time.")
+            for path in retry:
+                report(*_auto_one(path, dsts.get(path), opts))
     emit(f"Done: {len(files) - failed} of {len(files)} scans in {time.time() - t_start:.0f}s"
          + (f", {failed} failed." if failed else "."))
     return failed

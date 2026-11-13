@@ -124,8 +124,6 @@ def find_flat_regions(img: np.ndarray, tolerance: float = 0.06, min_area_pct: fl
     # leave a visible blotch, so such regions are dropped.
     cand_ids = np.flatnonzero(ok | small)
     if cand_ids.size:
-        stats = cv2.connectedComponentsWithStats((labels > 0).astype(np.uint8), 4)[2] \
-            if False else None
         ys, xs = np.nonzero(np.isin(labels, cand_ids))
         lab_of = labels[ys, xs]
         x0 = np.full(n, 1 << 30); y0 = np.full(n, 1 << 30); x1 = np.zeros(n, int); y1 = np.zeros(n, int)
@@ -331,9 +329,15 @@ def _extend_sections(labels, res, img, tolerance, reach):
     members = list(groups.values())
     leads = [max(m, key=lambda i: cnt[i]) for m in members]
     obs = np.float32([res.observed[l] for l in leads])
-    dist = np.stack([np.abs(med - o).max(axis=2) for o in obs])          # (K, h, w)
-    nearest = dist.argmin(axis=0)
-    dmin = dist.min(axis=0)
+    # nearest flat colour per pixel, one colour at a time (no K full images)
+    dmin = np.full((h, w), np.inf, np.float32)
+    nearest = np.zeros((h, w), np.int32)
+    for k, o in enumerate(obs):
+        d = np.abs(med - o).max(axis=2)
+        closer = d < dmin
+        dmin[closer] = d[closer]
+        nearest[closer] = k
+        del d, closer
     out = labels.copy()
     for k, mem in enumerate(members):
         own = np.isin(labels, mem)
@@ -366,19 +370,28 @@ def _extend_sections(labels, res, img, tolerance, reach):
     # is a mix - mostly this colour.
     pockets = np.zeros((h, w), bool)
     fine_lum = cv2.GaussianBlur(img, (0, 0), 1.0) @ np.float32([0.114, 0.587, 0.299])
+    # within 6 px of each colour's sections: computed once per colour, and
+    # the mix test below only looks at unassigned pixels there
+    near_col = [np.flatnonzero(((cv2.distanceTransform((grp_now != j + 1).astype(np.uint8),
+                                                        cv2.DIST_L2, 3) <= 6)
+                                & ~assigned).ravel())
+                for j in range(len(members))]
+    med_flat = med.reshape(-1, 3)
     for k, mem in enumerate(members):
         mixk = (dmin < 1.5 * tolerance) & (nearest == k)
+        mk_flat = mixk.ravel()
         for j in range(len(members)):
-            if j == k:
+            if j == k or not near_col[j].size:
                 continue
             v = obs[k] - obs[j]
             vv = float((v * v).sum())
             if vv < (3 * tolerance) ** 2:
                 continue
-            near_j = cv2.distanceTransform((grp_now != j + 1).astype(np.uint8), cv2.DIST_L2, 3) <= 6
-            al = ((med - obs[j]) @ v) / vv
-            res_ = np.abs(med - (obs[j] + np.clip(al, 0, 1)[..., None] * v)).max(axis=2)
-            mixk |= near_j & (al >= 0.65) & (res_ < 1.2 * tolerance)
+            idx = near_col[j]
+            px = med_flat[idx]
+            al = ((px - obs[j]) @ v) / vv
+            res_ = np.abs(px - (obs[j] + np.clip(al, 0, 1)[:, None] * v)).max(axis=1)
+            mk_flat[idx[(al >= 0.65) & (res_ < 1.2 * tolerance)]] = True
         cand = (~assigned) & mixk
         if not cand.any():
             continue

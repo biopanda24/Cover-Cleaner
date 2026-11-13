@@ -55,6 +55,8 @@ def _profile(img: np.ndarray, side: int, band: int) -> np.ndarray:
 
 def analyze_shading(img: np.ndarray, width_pct: float = 4.0) -> ShadingAnalysis:
     res = ShadingAnalysis()
+    if min(img.shape[:2]) < 64:                      # too small to tell shadow from print
+        return res
     band = max(8, int(min(img.shape[:2]) * width_pct / 100.0))
     for side in range(4):
         prof = _profile(img, side, band)
@@ -72,7 +74,7 @@ def analyze_shading(img: np.ndarray, width_pct: float = 4.0) -> ShadingAnalysis:
 
 def correct_shading(img: np.ndarray, width_pct: float = 4.0, strength: float = 1.0,
                     sides=(True, True, True, True)) -> np.ndarray:
-    if strength <= 0 or not any(sides):
+    if strength <= 0 or not any(sides) or min(img.shape[:2]) < 64:
         return img
     band = max(8, int(min(img.shape[:2]) * width_pct / 100.0))
     out = img.copy()

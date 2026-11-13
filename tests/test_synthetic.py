@@ -1,4 +1,5 @@
 """End-to-end checks on synthetic scans where the ground truth is known."""
+import os
 import cv2
 import numpy as np
 import pytest
@@ -456,7 +457,9 @@ def test_settings_roundtrip_and_output_names(tmp_path, monkeypatch):
     t = settings.load()
     assert (t.format, t.suffix, t.rules.staples) == ("jpg", "_clean", False)
     first = t.output_path(str(tmp_path / "scan.png"))
-    assert first.endswith("scan_clean.jpg")
+    # the scan's own folder is never used: results go into 'restored' there
+    assert first == os.path.join(str(tmp_path), "restored", "scan_clean.jpg")
+    os.makedirs(os.path.dirname(first), exist_ok=True)
     open(first, "w").close()
     assert t.output_path(str(tmp_path / "scan.png")).endswith("scan_clean (2).jpg")
     t.overwrite = True
@@ -477,3 +480,41 @@ def test_auto_leaves_flat_cleanup_off_unless_allowed():
     p_on, _ = auto_params(cover, pipeline=Pipeline(cover), flat_cleaner=True)
     assert not p_off.flat.enabled and p_on.flat.enabled
     assert any("Experimental" in r for r in rep_off)
+
+
+def test_batch_outputs_unique_and_never_over_scans(tmp_path):
+    from covercleaner.cli import plan_outputs
+    from covercleaner.settings import AppSettings
+    a, b = tmp_path / "f1", tmp_path / "f2"
+    a.mkdir(); b.mkdir()
+    files = [str(a / "front.png"), str(b / "front.png"), str(a / "front.tif")]
+    for f in files:
+        open(f, "w").close()
+    st = AppSettings()
+    st.overwrite = True
+    outs = plan_outputs(files, st, str(tmp_path / "out"))
+    assert len({os.path.normcase(p) for p in outs.values()}) == 3          # no collisions
+    st.save_dir = str(a)                                                     # the scans' folder
+    outs = plan_outputs([files[0]], st)
+    assert os.path.dirname(outs[files[0]]) == os.path.join(str(a), "restored")
+    dotted = tmp_path / "Covers v1.2"
+    outs = plan_outputs([files[0]], st, str(dotted))                         # a folder, not a file
+    assert os.path.dirname(outs[files[0]]) == str(dotted)
+    with pytest.raises(ValueError):
+        plan_outputs([files[0]], st, files[0])                               # the scan itself
+
+
+def test_read_dpi_from_tiff(tmp_path):
+    from covercleaner.imageio import read_dpi
+    img = np.full((20, 30, 3), 128, np.uint8)
+    path = str(tmp_path / "s.tif")
+    cv2.imwrite(path, img, [cv2.IMWRITE_TIFF_RESUNIT, 2, cv2.IMWRITE_TIFF_XDPI, 300,
+                            cv2.IMWRITE_TIFF_YDPI, 300])
+    assert read_dpi(path) == pytest.approx(300.0)
+
+
+def test_settings_survive_bad_values():
+    from covercleaner.settings import AppSettings
+    s = AppSettings.from_dict({"jobs": None, "scale": "abc", "overwrite": "false",
+                               "save_dir": None, "rules": {"staples": "off"}})
+    assert (s.jobs, s.scale, s.overwrite, s.save_dir, s.rules.staples) == (0, 1.0, False, "", False)

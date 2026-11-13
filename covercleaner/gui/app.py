@@ -174,6 +174,8 @@ class MainWindow(QMainWindow):
         self.pick_target: str | None = None
         self._widgets: dict[tuple[str, str], object] = {}
         self._jobs: list[Job] = []
+        self._auto_pending = False
+        self._auto_path: str | None = None     # file waiting for its Auto run
 
         self.view = ImageView()
         self.setCentralWidget(self.view)
@@ -297,10 +299,6 @@ class MainWindow(QMainWindow):
         b.setToolTip("Use the whole scan; then drag the corners in 'Original + outline'")
         row.addWidget(b)
         lay.addLayout(row)
-        cb = QCheckBox("Straighten curved edges (paper not flat)")
-        cb.toggled.connect(lambda on: self._set("geometry", "use_bow", on))
-        self._widgets[("geometry", "use_bow")] = cb
-        lay.addWidget(cb)
         grid = QGridLayout()
         self.trim_spins = []
         for i, name in enumerate(("Trim left", "top", "right", "bottom")):
@@ -434,7 +432,22 @@ class MainWindow(QMainWindow):
         if getattr(getattr(self.params, group), name) == value:
             return
         setattr(getattr(self.params, group), name, value)
+        if group == "geometry" and name in ("enabled", "angle"):
+            self._geometry_edited()
         self.request_render()
+
+    def _geometry_edited(self):
+        """The crop or rotation changed: staple fills and painted repairs are
+        in the old crop's pixel positions and would land on the wrong spot."""
+        had = bool(self.params.defects.patches) or (
+            self.pipe is not None and self.pipe.heal_mask is not None
+            and (self.pipe.heal_mask.any() or self.pipe.protect_mask.any()))
+        self.params.defects.patches = []
+        if self.pipe:
+            self.pipe.clear_masks()
+        if had:
+            self.statusBar().showMessage("The crop changed: staple fills and painted repairs "
+                                         "were cleared (run Auto or paint them again).")
 
     def _mode(self) -> str:
         return "ml" if self.mode_combo.currentIndex() == 1 else "traditional"
@@ -453,6 +466,7 @@ class MainWindow(QMainWindow):
     def _set_trim(self, k: int, v: int):
         if self.params.geometry.trim[k] != v:
             self.params.geometry.trim[k] = int(v)
+            self._geometry_edited()
             self.request_render()
 
     def _set_side(self, k: int, on: bool):
@@ -468,8 +482,7 @@ class MainWindow(QMainWindow):
 
     def _rotate(self, step: int):
         self.params.geometry.rotate90 = (self.params.geometry.rotate90 + step) % 4
-        if self.pipe:
-            self.pipe.clear_masks()
+        self._geometry_edited()
         self.request_render()
 
     def sync_controls(self):
@@ -520,12 +533,25 @@ class MainWindow(QMainWindow):
         """Show `paths` in the scan list and open `select` (or the first)."""
         paths = [os.path.abspath(p) for p in paths]
         dirs = {os.path.dirname(p) for p in paths}
-        self.folder = folder or (dirs.pop() if len(dirs) == 1 else
-                                 (os.path.commonpath(paths) if paths else self.folder))
+        if folder:
+            self.folder = folder
+        elif len(dirs) == 1:
+            self.folder = dirs.pop()
+        else:
+            try:
+                self.folder = os.path.commonpath(paths) if paths else self.folder
+            except ValueError:              # files on different drives
+                self.folder = os.path.dirname(paths[0])
         self.file_list.blockSignals(True)
         self.file_list.clear()
         for p in paths:
-            label = os.path.basename(p) if len(dirs) <= 1 else os.path.relpath(p, self.folder)
+            if len(dirs) <= 1:
+                label = os.path.basename(p)
+            else:
+                try:
+                    label = os.path.relpath(p, self.folder)
+                except ValueError:          # another drive
+                    label = p
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, p)
             item.setToolTip(p)
@@ -612,7 +638,13 @@ class MainWindow(QMainWindow):
         self._set_enabled(True)
         self.sync_controls()
         self.view.set_overlay(None)
+        self.pick_target = None             # a pending "Pick white/black" ends here
+        self.brush_combo.blockSignals(True)
+        self.brush_combo.setCurrentIndex(0)
+        self.brush_combo.blockSignals(False)
+        self.view.set_mode("pan")
         self.set_view_mode("original", keep_view=False)
+        self._auto_path = None              # a pending Auto for the old file is void
         if auto:
             self.run_auto()
 
@@ -648,8 +680,11 @@ class MainWindow(QMainWindow):
     def run_auto(self):
         if self.source is None:
             return
+        self._auto_path = self.path         # the file this Auto run is for
         if self.busy:                       # e.g. the previous file is still rendering
-            QTimer.singleShot(300, self.run_auto)
+            if not self._auto_pending:      # one retry, for whatever file is open then
+                self._auto_pending = True
+                QTimer.singleShot(300, self._retry_auto)
             return
         self.busy = True
         src, pipe, path, mode = self.source, self.pipe, self.path, self._mode()
@@ -665,6 +700,7 @@ class MainWindow(QMainWindow):
             rpath, (params, report) = res
             if rpath != self.path:
                 return                      # another file was opened meanwhile
+            self._auto_path = None
             self.params = params
             self.report.setPlainText("\n".join(report))
             self.sync_controls()
@@ -673,6 +709,11 @@ class MainWindow(QMainWindow):
             self.request_render()
 
         self._run_job(work, done, "Analysing…")
+
+    def _retry_auto(self):
+        self._auto_pending = False
+        if self._auto_path is not None and self._auto_path == self.path:
+            self.run_auto()
 
     def request_render(self):
         if self.pipe is None:
@@ -747,27 +788,46 @@ class MainWindow(QMainWindow):
         self.params.geometry.corners = [[float(a), float(b)] for a, b in c]
         self.params.geometry.disc = False   # hand-placed corners: plain crop
         self.view.update_outline_only(_geometry.outline_points(c, self._bow()))
-        if self.pipe:
-            self.pipe.clear_masks()         # painted marks no longer line up
+        self._geometry_edited()             # painted marks no longer line up
         self.dirty = True                   # render when the handle is released
 
     def detect_outline(self):
         if self.source is None:
             return
-        det = _geometry.detect_cover(self.source, dpi=read_dpi(self.path))
-        g = self.params.geometry
-        if det.has_background:
-            g.corners = [[float(x), float(y)] for x, y in det.corners]
-            g.bow = [[float(v) for v in row] for row in det.bow]
-            g.trim = [int(t) for t in det.trim]
-            g.disc = det.disc is not None
-        else:
-            g.corners = None
-            self.statusBar().showMessage("No scanner background found around the cover.")
-        g.enabled = True
-        self.sync_controls()
-        self._refresh_outline()
-        self.request_render()
+        if self.busy:
+            self.statusBar().showMessage("Still processing - try again in a moment.")
+            return
+        self.busy = True
+        src, path, st = self.source, self.path, self.settings
+
+        def work(progress):
+            progress("Finding cover outline", 0.1)
+            return path, _geometry.detect_cover(src, dpi=st.dpi_for(read_dpi(path)),
+                                                rules=st.rules)
+
+        def done(res):
+            self.busy = False
+            self.progress.hide()
+            rpath, det = res
+            if rpath != self.path:
+                return
+            g = self.params.geometry
+            if det.has_background:
+                g.corners = [[float(x), float(y)] for x, y in det.corners]
+                g.bow = [[float(v) for v in row] for row in det.bow]
+                g.trim = [int(t) for t in det.trim]
+                g.disc = det.disc is not None
+                self.statusBar().showMessage("Outline detected.")
+            else:
+                g.corners = None
+                self.statusBar().showMessage("No scanner background found around the cover.")
+            g.enabled = True
+            self._geometry_edited()
+            self.sync_controls()
+            self._refresh_outline()
+            self.request_render()
+
+        self._run_job(work, done, "Finding cover outline…")
 
     def outline_full(self):
         g = self.params.geometry
@@ -775,6 +835,7 @@ class MainWindow(QMainWindow):
         g.bow = None
         g.trim = [0, 0, 0, 0]
         g.disc = False
+        self._geometry_edited()
         self.sync_controls()
         self.set_view_mode("original")
         self.request_render()
@@ -782,16 +843,32 @@ class MainWindow(QMainWindow):
     def detect_screen(self):
         if self.pipe is None:
             return
-        img = self.pipe.run(self.params, upto="geometry")
-        scr = _descreen.analyze_screen(img)
-        d = self.params.descreen
-        if scr.found:
-            d.peaks, d.period, d.enabled = scr.peaks, scr.period, True
-        else:
-            d.peaks, d.period, d.enabled = [], 0.0, False
-            self.statusBar().showMessage("No halftone screen found in this scan.")
-        self.sync_controls()
-        self.request_render()
+        if self.busy:
+            QTimer.singleShot(300, self.detect_screen)
+            return
+        self.busy = True
+        pipe, params, path = self.pipe, self.params.copy(), self.path
+
+        def work(progress):
+            progress("Analysing print screen", 0.2)
+            return path, _descreen.analyze_screen(pipe.run(params, upto="geometry"))
+
+        def done(res):
+            self.busy = False
+            self.progress.hide()
+            rpath, scr = res
+            if rpath != self.path:
+                return
+            d = self.params.descreen
+            if scr.found:
+                d.peaks, d.period, d.enabled = scr.peaks, scr.period, True
+            else:
+                d.peaks, d.period, d.enabled = [], 0.0, False
+                self.statusBar().showMessage("No halftone screen found in this scan.")
+            self.sync_controls()
+            self.request_render()
+
+        self._run_job(work, done, "Analysing print screen…")
 
     def _show_before(self, on: bool):
         if self.view_mode != "result" or self.result is None or self.pipe is None:
@@ -989,7 +1066,7 @@ class MainWindow(QMainWindow):
             def emit(text):
                 log.append(text)
 
-            _cli.run_batch(files, st, out, emit=emit,
+            _cli.run_batch(files, st, out, emit=emit, output_is_dir=True,
                            progress=lambda k, n: progress(f"Restoring {k}/{n}", k / n))
             return log
 

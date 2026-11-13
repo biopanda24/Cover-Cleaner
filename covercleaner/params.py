@@ -110,7 +110,6 @@ class SharpenParams:
 @dataclass
 class OutputParams:
     scale: float = 1.0        # resample factor applied last
-    bit_depth: int = 8
 
 
 @dataclass

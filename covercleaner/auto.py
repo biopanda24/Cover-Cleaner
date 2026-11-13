@@ -61,8 +61,6 @@ def auto_params(source: np.ndarray, progress: Progress = None,
         w, h = geometry.output_size(det.corners)
         report.append(f"Crop/deskew: cover {w} x {h} px found, rotated {det.angle_deg:+.2f} deg; "
                       f"edge trim L{g.trim[0]} T{g.trim[1]} R{g.trim[2]} B{g.trim[3]} px.")
-        if g.use_bow:
-            report.append(f"Flatten: paper edges bow by up to {det.max_bow:.1f} px; straightening.")
         weak = [geometry.SIDE_NAMES[i] for i, c in enumerate(det.side_confidence) if c < 0.3]
         if weak:
             report.append("  Low confidence on the " + ", ".join(weak)

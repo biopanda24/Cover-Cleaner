@@ -73,11 +73,46 @@ def gpu_free_mb() -> int:
     """Free memory on the first NVIDIA GPU in MB, or 0 if unknown."""
     import subprocess
     try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)    # no console flash (pythonw)
         out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=10).stdout
+                             capture_output=True, text=True, timeout=10,
+                             creationflags=flags).stdout
         return int(out.split()[0])
     except Exception:
         return 0
+
+
+def prepare_gpu_model() -> bool:
+    """Write the GPU copy of the model if it is missing; True when it exists.
+
+    Called once by a batch before starting workers, so they do not all
+    convert it at the same time.  Each process writes its own temporary
+    file, and the first to finish wins.
+    """
+    path = float_model_path()
+    if os.path.isfile(path):
+        return True
+    if not available():
+        return False
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from tools.lama_float import convert  # needs the 'onnx' package
+        convert(model_path(), tmp)
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            pass                              # another process got there first
+    except Exception:
+        return os.path.isfile(path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return os.path.isfile(path)
 
 
 def _gpu_session():
@@ -89,12 +124,8 @@ def _gpu_session():
         if hasattr(ort, "preload_dlls"):
             ort.preload_dlls()                  # CUDA / cuDNN from the nvidia-* wheels
         path = float_model_path()
-        if not os.path.isfile(path):
-            import sys
-            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            from tools.lama_float import convert  # needs the 'onnx' package
-            convert(model_path(), path + ".tmp")
-            os.replace(path + ".tmp", path)
+        if not prepare_gpu_model():
+            return None
         so = ort.SessionOptions()
         so.log_severity_level = 3
         cuda = {"arena_extend_strategy": "kSameAsRequested"}
@@ -116,12 +147,6 @@ def _load():
         else:
             _net, _gpu = cv2.dnn.readNetFromONNX(model_path()), False
     return _net
-
-
-def device() -> str:
-    """Where LaMa runs: "GPU (CUDA)" or "CPU" (loads the model)."""
-    _load()
-    return "GPU (CUDA)" if _gpu else "CPU"
 
 
 def _infer(patch: np.ndarray, mask: np.ndarray) -> np.ndarray:

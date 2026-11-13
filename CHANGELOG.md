@@ -3,6 +3,43 @@
 Version numbers follow semantic versioning: the minor number goes up for
 new features, the patch number for fixes.
 
+## 0.3.1 - 2026-11-13
+
+Fixes from a code review:
+
+- Results are never written into a scans folder: a `restored` folder
+  inside it is used instead (command line too), so originals can't be
+  overwritten.
+- Output names are reserved for the whole batch up front: two scans with
+  the same name (a.png and a.tif, or front.png from two folders) no longer
+  overwrite each other in a parallel batch.
+- A one-scan batch into a folder with a dot in its name works (the editor's
+  target is always a folder; the command line treats `-o` as a file only
+  when it ends in an image extension).
+- If a batch worker crashes, the remaining scans are retried one at a time
+  instead of all being reported as failed.
+- The GPU copy of the model is made once before a parallel batch starts,
+  not by every worker at once.
+- Editor: rotating, trimming, moving corners, Detect outline and Whole
+  image clear staple fills and painted repairs (they no longer land on the
+  wrong spot), with a note in the status bar.
+- Editor: browsing through files while one renders no longer queues
+  several Auto runs that overwrite your edits.
+- Editor: Detect outline uses the fallback DPI and the Auto crop rules from
+  Options, and runs in the background, as does Detect screen.
+- Editor: a pending Pick white/black ends when another scan is opened.
+- Editor: files dropped from different drives together open correctly.
+- Scan resolution is read from TIFF files and from JPEG Exif data, and
+  JFIF resolutions in dots per cm are converted.
+- Flat colour cleanup: much faster and lighter with many colours (22
+  colours: 21 s -> 4 s on a test image); results unchanged.
+- Options file: an unreadable value only resets that one option, and
+  text like "false" is read correctly.
+- No console window flashes when checking GPU memory; tiny images no
+  longer crash edge shading.
+- Removed the "Straighten curved edges" checkbox (it had no effect) and
+  other unused code.
+
 ## 0.3.0 - 2026-11-13
 
 - Drag scans and/or folders onto the editor window to open them: a
