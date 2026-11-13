@@ -1,7 +1,8 @@
 numpy>=1.26,<3
 scipy>=1.11
-opencv-python-headless>=4.9
+opencv-python-headless>=5.0
 PySide6>=6.6
+truststore>=0.9           # HTTPS checks through the system certificate store
 # Optional, NVIDIA GPU for ML inpainting (see README):
 #   onnxruntime-gpu[cuda]==1.23.2
 #   nvidia-cudnn-cu12==9.10.2.21

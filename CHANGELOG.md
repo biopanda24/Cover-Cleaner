@@ -3,6 +3,24 @@
 Version numbers follow semantic versioning: the minor number goes up for
 new features, the patch number for fixes.
 
+## 0.4.0 - 2026-11-13
+
+Installers and updates:
+
+- Installers for Windows (setup .exe), Linux (.run) and macOS (.command),
+  built by `installer/build.py` and, on a version tag, by a GitHub Actions
+  workflow that publishes the release. Each sets up its own Python and
+  packages and offers - on by default - the ML models and NVIDIA GPU
+  support (`python -m covercleaner.setup_models` does the same later).
+- *Help > About* links to the GitHub project and has *Check for updates*.
+- Cover Cleaner checks for a new version when it starts (can be turned off
+  in Options; a version can be skipped) and can update itself: it
+  downloads the release, checks its SHA-256, installs it after closing,
+  keeps the models, rolls back on failure and starts again.
+- Downloads use the system certificate store (truststore), so HTTPS checks
+  no longer fail at random on Windows.
+- Requires OpenCV 5.
+
 ## 0.3.1 - 2026-11-13
 
 Fixes from a code review:

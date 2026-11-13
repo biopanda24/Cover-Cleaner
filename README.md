@@ -3,6 +3,60 @@
 Restores scanned media covers (CD, DVD, VHS, cassette) towards what the
 original artwork looked like before it was printed and scanned.
 
+## Install
+
+Download the installer for your system from the
+[releases page](https://github.com/biopanda24/Cover-Cleaner/releases):
+
+- **Windows:** `CoverCleaner-<version>-windows-setup.exe`. Installs for the
+  current user (no administrator rights needed) under
+  `%LOCALAPPDATA%\Programs\Cover Cleaner`, with a Start menu entry.
+- **Linux:** `bash CoverCleaner-<version>-linux.run` (`--help` for the
+  options, e.g. `--yes` to accept the recommended answers). Installs to
+  `~/.local/share/cover-cleaner` with an applications-menu entry and a
+  `cover-cleaner` command. The Qt window needs the `libxcb-cursor0`
+  system library.
+- **macOS:** unzip `CoverCleaner-<version>-macos.zip` and double-click the
+  `.command` file (if macOS blocks it: right-click > Open). Installs
+  *Cover Cleaner* in `~/Applications`.
+
+Every installer sets up its own Python and packages (with
+[uv](https://docs.astral.sh/uv/); nothing is installed system-wide) and
+asks whether to also download - both recommended and on by default:
+
+- the **ML models** (LaMa inpainting and the disc text models, about
+  160 MB);
+- **NVIDIA GPU acceleration** for ML (about 1.5 GB; Windows and Linux,
+  only offered when an NVIDIA GPU is found).
+
+Either can be added later from an installed copy with
+`python -m covercleaner.setup_models --models --gpu`.
+
+## Updating
+
+Cover Cleaner checks GitHub for a new version when it starts (turn this off
+in *Options > Processing > Updates*) and from *Help > About > Check for
+updates*. *Update now* downloads the new version, checks it against its
+published SHA-256, closes Cover Cleaner, installs it (keeping the
+downloaded models and your options), and starts it again; if anything goes
+wrong the previous version is put back (see `update.log` in the install
+folder). Copies run from a git checkout update with `git pull` instead.
+
+## Building the installers
+
+```
+python installer/build.py                      all targets, into dist/
+python installer/build.py --targets linux,macos
+```
+
+The Linux and macOS installers and the app archive used by updates can be
+built on any system. The Windows setup .exe needs
+[Inno Setup 6](https://jrsoftware.org/isinfo.php) (without it a zip with
+an `Install Cover Cleaner.cmd` is built instead). Pushing a version tag
+(`git tag v0.4.0 && git push origin v0.4.0`) runs
+`.github/workflows/installers.yml`, which builds everything on GitHub and
+publishes the release that the in-app updater looks for.
+
 ## Run
 
 ```
@@ -17,7 +71,7 @@ CoverCleaner.bat Scans           open the editor on a folder (or drop
 limited by free memory); set the number with `-j`, e.g. `-j 1` for one at
 a time.
 
-First-time setup: `python -m venv .venv` then
+From a source checkout, first-time setup: `python -m venv .venv` then
 `.venv\Scripts\python -m pip install -r requirements.txt`.
 
 ## What it fixes
@@ -221,8 +275,13 @@ covercleaner/
   auto.py       Auto mode analysis
   params.py     all settings (JSON serialisable)
   cli.py        command line / batch
+  updater.py    new-version check and in-program updates (GitHub releases)
+  update_helper.py  installs a downloaded update after the program closes
+  setup_models.py   downloads the ML models / sets up GPU support
+  net.py        HTTPS via the system certificate store
   gui/          PySide6 editor
-tests/          synthetic ground-truth tests (pytest)
+installer/      build.py and the Windows / Linux / macOS installer sources
+tests/          synthetic ground-truth and updater tests (pytest)
 tools/          batch_eval.py (Auto on a folder, in parallel, for review),
                 review_sheets.py (before/after sheets + decision table),
                 outline_check.py / edge_zoom.py (inspect detected outlines)

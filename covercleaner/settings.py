@@ -42,6 +42,9 @@ class AppSettings:
     # Auto
     flat_cleaner: bool = False    # Experimental: flat colour cleanup when flat areas are found
     rules: AutoRules = field(default_factory=AutoRules)
+    # updates
+    check_updates: bool = True    # look for a new version when the program starts
+    skip_version: str = ""        # a version the user chose to skip
 
     # ---- helpers ---------------------------------------------------------
     def mode(self, ml_available: bool) -> str:

@@ -20,6 +20,7 @@ from .. import __version__
 from .. import cli as _cli
 from .. import descreen as _descreen
 from .. import settings as _settings
+from .. import updater as _updater
 from .. import geometry as _geometry
 from .. import ml as _ml
 from ..auto import auto_params
@@ -175,6 +176,8 @@ class MainWindow(QMainWindow):
         self._widgets: dict[tuple[str, str], object] = {}
         self._jobs: list[Job] = []
         self._auto_pending = False
+        self.net_pool = QThreadPool(self)          # update checks/downloads, apart from renders
+        self.net_pool.setMaxThreadCount(1)
         self._auto_path: str | None = None     # file waiting for its Auto run
 
         self.view = ImageView()
@@ -202,6 +205,8 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self._start_render)
         self._set_enabled(False)
         self.statusBar().showMessage("Open a scan or a folder of scans to begin.")
+        if self.settings.check_updates:
+            QTimer.singleShot(2000, self._startup_update_check)
 
     # ---- construction ----------------------------------------------------
     def _build_toolbar(self):
@@ -1105,8 +1110,120 @@ class MainWindow(QMainWindow):
         m.addAction(opt)
         m = mb.addMenu("&Help")
         about = QAction(f"&About {APP_NAME}", self)
-        about.triggered.connect(lambda: AboutDialog(self).exec())
+        about.triggered.connect(self.show_about)
         m.addAction(about)
+
+    # ---- updates -----------------------------------------------------------
+    def _net_job(self, fn, done, error=None):
+        job = Job(fn)
+        job.setAutoDelete(False)
+        self._jobs.append(job)
+
+        def finish():
+            if job in self._jobs:
+                self._jobs.remove(job)
+
+        job.signals.done.connect(lambda res: (finish(), done(res)))
+        job.signals.error.connect(lambda msg: (finish(), error(msg) if error else None))
+        self.net_pool.start(job)
+        return job
+
+    def check_for_updates(self, on_result):
+        """Background check; on_result(release_or_None, error_or_None)."""
+        def work(_progress):
+            try:
+                return _updater.check(), None
+            except _updater.UpdateError as exc:
+                return None, str(exc)
+
+        self._net_job(work, lambda res: on_result(*res),
+                      lambda msg: on_result(None, msg.strip().splitlines()[-1]))
+
+    def _startup_update_check(self):
+        def done(release, error):
+            if release is not None and release.version != self.settings.skip_version:
+                self._offer_update(release, startup=True)
+        self.check_for_updates(done)
+
+    def show_about(self):
+        AboutDialog(self, check=self.check_for_updates, update=self.update_to).exec()
+
+    def _offer_update(self, release, startup: bool = False):
+        box = QMessageBox(self)
+        box.setWindowTitle(APP_NAME)
+        box.setIcon(QMessageBox.Information)
+        box.setText(f"<b>{APP_NAME} {release.version} is available</b><br>"
+                    f"You have version {__version__}.")
+        if release.notes:
+            box.setDetailedText(release.notes)
+        b_update = box.addButton("Update now", QMessageBox.AcceptRole)
+        b_view = box.addButton("View on GitHub", QMessageBox.HelpRole)
+        b_skip = box.addButton("Skip this version", QMessageBox.RejectRole) if startup else None
+        box.addButton("Later", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is b_update:
+            self.update_to(release)
+        elif clicked is b_view:
+            from PySide6.QtCore import QUrl
+            from PySide6.QtGui import QDesktopServices
+            QDesktopServices.openUrl(QUrl(release.url))
+        elif b_skip is not None and clicked is b_skip:
+            self.settings.skip_version = release.version
+            try:
+                _settings.save(self.settings)
+            except OSError:
+                pass
+
+    def update_to(self, release):
+        ok, why = _updater.can_update()
+        if not ok:
+            QMessageBox.information(
+                self, APP_NAME, f"{why}<br><br>Version {release.version}: "
+                f'<a href="{release.url}">{release.url}</a>')
+            return
+        if self.busy:
+            QMessageBox.information(self, APP_NAME, "Please wait until the current work "
+                                    "has finished, then update.")
+            return
+        if QMessageBox.question(
+                self, APP_NAME,
+                f"Download and install {APP_NAME} {release.version}?\n\n"
+                "Cover Cleaner closes while it installs the update and then starts again. "
+                "Unsaved results are lost.") != QMessageBox.Yes:
+            return
+        from PySide6.QtWidgets import QProgressDialog
+        dlg = QProgressDialog(f"Downloading {APP_NAME} {release.version}…", None, 0, 100, self)
+        dlg.setWindowTitle(APP_NAME)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setValue(0)
+        dlg.show()
+
+        def work(progress):
+            def cb(done, total):
+                if total:
+                    progress("downloading", done / total)
+            return _updater.download(release, cb)
+
+        def done(new_app):
+            dlg.setLabelText("Starting the update…")
+            try:
+                _updater.start_update(new_app, release.version)
+            except Exception as exc:
+                dlg.close()
+                QMessageBox.critical(self, APP_NAME, f"The update could not start:\n{exc}")
+                return
+            dlg.close()
+            QApplication.instance().quit()
+
+        def failed(msg):
+            dlg.close()
+            QMessageBox.critical(self, APP_NAME, "The update failed; nothing was changed.\n\n"
+                                 + msg.strip().splitlines()[-1])
+
+        job = self._net_job(work, done, failed)
+        job.signals.progress.connect(lambda _n, f: dlg.setValue(int(f * 100)))
 
     def open_options(self):
         dlg = OptionsDialog(self.settings, self)

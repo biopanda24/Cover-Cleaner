@@ -1,0 +1,55 @@
+# Builds the installers and publishes them as a GitHub release when a
+# version tag is pushed (git tag v0.4.0 && git push origin v0.4.0).
+# The in-app updater looks for the CoverCleaner-<version>-app.zip asset.
+name: installers
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Check the tag matches the version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          v=$(python -c "import re;print(re.search(r'__version__\s*=\s*\"([^\"]+)\"',open('covercleaner/__init__.py').read()).group(1))")
+          test "v$v" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} but __version__ is $v"; exit 1; }
+
+      - name: Build
+        run: python installer/build.py --targets windows,linux,macos --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers
+          path: dist/*
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.exe
+            dist/*.run
+            dist/*.zip
+            dist/*.sha256
+          generate_release_notes: true

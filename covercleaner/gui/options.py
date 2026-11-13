@@ -130,6 +130,11 @@ class OptionsDialog(QDialog):
         self.dpi.setToolTip("Assumed for scans that store no resolution. The standard-size, "
                             "white-border and staple rules need it.")
         f.addRow("Fallback DPI", self.dpi)
+        self.updates = QCheckBox("Check for a new version when Cover Cleaner starts")
+        self.updates.setChecked(self._s.check_updates)
+        self.updates.setToolTip("Asks GitHub for the latest release; nothing else is sent. "
+                                "Help > About can always check by hand.")
+        f.addRow("Updates", self.updates)
 
         # ---- Auto --------------------------------------------------------
         f = _form(tabs, "Auto")
@@ -218,6 +223,7 @@ class OptionsDialog(QDialog):
         self.gpu.setChecked(d.use_gpu)
         self.jobs.setValue(d.jobs)
         self.dpi.setValue(d.fallback_dpi)
+        self.updates.setChecked(d.check_updates)
         self.flat.setChecked(d.flat_cleaner)
         for cb, v in ((self.r_size, d.rules.standard_size), (self.r_white, d.rules.white_border),
                       (self.r_strip, d.rules.strip_crop), (self.r_staples, d.rules.staples)):
@@ -237,6 +243,8 @@ class OptionsDialog(QDialog):
         s.use_gpu = self.gpu.isChecked()
         s.jobs = self.jobs.value()
         s.fallback_dpi = float(self.dpi.value())
+        s.check_updates = self.updates.isChecked()
+        s.skip_version = self._s.skip_version
         s.flat_cleaner = self.flat.isChecked()
         s.rules = AutoRules(standard_size=self.r_size.isChecked(),
                             white_border=self.r_white.isChecked(),
@@ -246,25 +254,72 @@ class OptionsDialog(QDialog):
 
 
 def about_label() -> QLabel:
+    from ..updater import REPO_URL
     lab = QLabel(
         f"<h2>{APP_NAME}</h2>"
         f"<p>Version {__version__}</p>"
         "<p>Restores scanned CD, DVD, VHS and cassette covers to look like the clean "
         "original artwork.</p>"
+        f'<p><a href="{REPO_URL}">{REPO_URL}</a></p>'
         f"<p><b>Credits</b><br>{CREDITS}</p>"
         "<p>LaMa inpainting model and text models from the OpenCV model zoo "
         "(Apache-2.0).</p>")
     lab.setTextFormat(Qt.RichText)
+    lab.setOpenExternalLinks(True)
+    lab.setTextInteractionFlags(Qt.TextBrowserInteraction)
     lab.setWordWrap(True)
     return lab
 
 
 class AboutDialog(QDialog):
-    def __init__(self, parent=None):
+    """Version, credits, GitHub link and a manual update check.
+
+    `check(on_result)` runs the check in the background and calls
+    on_result(release_or_None, error_text_or_None); `update(release)` starts
+    the update."""
+
+    def __init__(self, parent=None, check=None, update=None):
         super().__init__(parent)
         self.setWindowTitle(f"About {APP_NAME}")
+        self.setMinimumWidth(420)
+        self._check, self._update, self._release = check, update, None
         lay = QVBoxLayout(self)
         lay.addWidget(about_label())
+        row = QHBoxLayout()
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.btn_check = QPushButton("Check for updates")
+        self.btn_check.clicked.connect(self._run_check)
+        self.btn_update = QPushButton("Update now…")
+        self.btn_update.clicked.connect(self._run_update)
+        self.btn_update.hide()
+        row.addWidget(self.status, 1)
+        row.addWidget(self.btn_update)
+        row.addWidget(self.btn_check)
+        lay.addLayout(row)
         b = QDialogButtonBox(QDialogButtonBox.Ok)
         b.accepted.connect(self.accept)
         lay.addWidget(b)
+        if check is None:
+            self.btn_check.hide()
+
+    def _run_check(self):
+        self.btn_check.setEnabled(False)
+        self.status.setText("Checking…")
+        self._check(self._checked)
+
+    def _checked(self, release, error):
+        self.btn_check.setEnabled(True)
+        if error:
+            self.status.setText(f"Could not check: {error}")
+        elif release is None:
+            self.status.setText(f"You have the latest version ({__version__}).")
+        else:
+            self._release = release
+            self.status.setText(f"Version {release.version} is available.")
+            self.btn_update.setVisible(self._update is not None)
+
+    def _run_update(self):
+        if self._release is not None and self._update is not None:
+            self.accept()
+            self._update(self._release)
