@@ -13,12 +13,19 @@ finds such areas and paints each one with one even colour:
    style artwork) rather than fading softly into a picture.
 3. Regions of (almost) the same colour anywhere on the cover are unified to
    one palette colour.
-4. Regions are grown up to their true edges and blended in with a narrow
-   feather, so the anti-aliased outlines of shapes and letters are kept.
+4. Each section is grown out to its true edge over pixels of its colour
+   (judged after a median that removes grain and specks), takes in small
+   enclosed specks, and is painted with its one colour - fully up to the
+   tolerance, fading out by twice it so stains and soft shading blend in;
+   fine detail that clearly stands out (dots, hairlines) is kept.
+5. Only the thin anti-aliased boundary between two sections is redrawn, as
+   a mix of their two clean colours.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+DEBUG = None      # set to {} to capture edge-rebuild internals
 
 import cv2
 import numpy as np
@@ -279,7 +286,11 @@ def _thin_strokes(labels, res, img, tolerance):
         own_lum = float(res.observed[lead] @ np.float32([0.114, 0.587, 0.299]))
         darker = np.bincount(rc2[outer & (lum < own_lum - 0.08)], minlength=n)
         lighter = np.bincount(rc2[outer & (lum > own_lum + 0.08)], minlength=n)
-        extreme = np.minimum(darker, lighter) <= 0.1 * np.maximum(outer_n, 1)
+        tot = np.maximum(outer_n, 1)
+        # mostly clearly lighter around it (a dark stroke) or mostly darker (a
+        # light one); a ring of flare next to black ink has black on one side
+        extreme = (((darker <= 0.1 * tot) & (lighter >= 0.7 * tot))
+                   | ((lighter <= 0.1 * tot) & (darker >= 0.7 * tot)))
         stands_out &= extreme
         # ... and it is long and thin, not a blob or speckle of a photo
         area = stats[:, cv2.CC_STAT_AREA]
@@ -292,6 +303,73 @@ def _thin_strokes(labels, res, img, tolerance):
         out[sel] = lead
         adopted |= sel
     return out, adopted
+
+
+def _extend_sections(labels, res, img, tolerance, reach):
+    """Grow every flat section out to its true edge and take in its specks.
+
+    The region test stops a few pixels short of an outline, and mottle,
+    dust or a ring of scanner flare inside a section stays unlabelled.
+    Here each pixel within `reach` px of a section is given to it when its
+    colour - after a median that removes grain and specks - is within
+    1.5x the tolerance of the section's colour, and closer to it than to any
+    other flat colour (connected to the section, so a photo nearby is not
+    claimed beyond that reach).  Small enclosed holes surrounded by one
+    section join it.  What remains between sections is the anti-aliased
+    edge, redrawn afterwards.
+    """
+    h, w = labels.shape
+    inside = labels > 0
+    if not inside.any():
+        return labels
+    med = cv2.GaussianBlur(cv2.medianBlur(np.ascontiguousarray(img, np.float32), 5), (0, 0), 1.0)
+    cnt = np.bincount(labels.ravel(), minlength=len(res.colours))
+    groups: dict = {}
+    for i in np.unique(labels[inside]):
+        groups.setdefault(tuple(np.round(res.colours[i], 4)), []).append(int(i))
+    members = list(groups.values())
+    leads = [max(m, key=lambda i: cnt[i]) for m in members]
+    obs = np.float32([res.observed[l] for l in leads])
+    dist = np.stack([np.abs(med - o).max(axis=2) for o in obs])          # (K, h, w)
+    nearest = dist.argmin(axis=0)
+    dmin = dist.min(axis=0)
+    out = labels.copy()
+    for k, mem in enumerate(members):
+        own = np.isin(labels, mem)
+        near = cv2.distanceTransform((~own).astype(np.uint8), cv2.DIST_L2, 3) <= reach
+        cand = (~inside) & near & (nearest == k) & (dmin < 2.0 * tolerance)
+        if not cand.any():
+            continue
+        # only pixels connected to the section itself
+        n, comp = cv2.connectedComponents((cand | own).astype(np.uint8), connectivity=8)
+        keep = np.zeros(n, bool)
+        keep[np.unique(comp[own])] = True
+        keep[0] = False
+        grow = cand & keep[comp]
+        out[grow] = leads[k]
+    # enclosed holes (specks, dust, flare) up to ~1 mm across, inside one section
+    free = (out == 0).astype(np.uint8)
+    n, hl, stats, _ = cv2.connectedComponentsWithStats(free, 8)
+    if n > 1:
+        size = np.maximum(stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT])
+        small = size <= max(6, int(0.009 * min(h, w)))
+        small[0] = False
+        lut = np.zeros(len(res.colours), np.int32)
+        for k, mem in enumerate(members):
+            lut[mem] = k + 1
+        grp = lut[out]
+        ring = (cv2.dilate(free, np.ones((3, 3), np.uint8)) > 0) & (free == 0)
+        rid = cv2.dilate(hl.astype(np.float32), np.ones((3, 3), np.uint8)).astype(np.int32)
+        sel = ring & small[rid]
+        if sel.any():
+            g_hi = np.zeros(n, np.int64)
+            g_lo = np.full(n, 1 << 30, np.int64)
+            np.maximum.at(g_hi, rid[sel], grp[sel])
+            np.minimum.at(g_lo, rid[sel], grp[sel])
+            one = small & (g_hi == g_lo) & (g_hi > 0)
+            fill = one[hl]
+            out[fill] = np.array([0] + leads)[g_hi[hl[fill]]]
+    return out
 
 
 def flatten(img: np.ndarray, tolerance: float = 0.06, min_area_pct: float = 0.05,
@@ -349,6 +427,8 @@ def flatten(img: np.ndarray, tolerance: float = 0.06, min_area_pct: float = 0.05
             labels[edge] = hi[edge].astype(np.int32)
             hi, lo = around(labels.astype(np.float32))
     labels, thin = _thin_strokes(labels, res, img, tolerance)
+    seeds = labels > 0
+    labels = _extend_sections(labels, res, img, tolerance, reach=12.0)
     inside = labels > 0
     st = float(min(strength, 1.0))
     # Blend by closeness: a pixel near a region's colour (as scanned) becomes
@@ -370,9 +450,16 @@ def flatten(img: np.ndarray, tolerance: float = 0.06, min_area_pct: float = 0.05
     # Inside a region, specks of mottle a few px across are not detail:
     # judge closeness after a median that removes them.
     med = cv2.GaussianBlur(cv2.medianBlur(np.ascontiguousarray(img, np.float32), 5), (0, 0), 1.0)
-    d = np.where(inside, np.abs(med - seen).max(axis=2), d)
     close = np.clip((tolerance - d) / (0.5 * tolerance), 0.0, 1.0)
-    close[thin] = 1.0                    # adopted strokes matched already
+    # A section is one colour: grain, mottle and flare (judged after the
+    # median) are painted fully up to the tolerance, fading out by twice it,
+    # so a stain or soft shading blends in instead of ending in a hard edge.
+    # Fine detail that clearly stands out - dots, hairlines - is kept.
+    d_med = np.abs(med - seen).max(axis=2)
+    d_fine = np.abs(cv2.GaussianBlur(img, (0, 0), 1.0) - seen).max(axis=2)
+    sec = (np.clip((2.0 * tolerance - d_med) / tolerance, 0.0, 1.0)
+           * np.clip((6.0 * tolerance - d_fine) / (2.0 * tolerance), 0.0, 1.0))
+    close = np.where(inside, sec, close)
     wgt = cv2.GaussianBlur((close * prox).astype(np.float32), (0, 0), 1.0) * (near_lab > 0)
     out = img + (st * wgt)[:, :, None] * (target - img)
     mask = (wgt > 0.5).astype(np.uint8) * 255
@@ -500,6 +587,13 @@ def _rebuild_edges(out, img, smooth, labels, res, tolerance, st, wmain, near_lab
                               mixed * steep,
                               cover * np.maximum(mixed * steep,
                                                  np.clip((2.0 * tolerance - off) / (0.8 * tolerance), 0.0, 1.0))])
+    # between two sections that are flat all round, every pixel of the edge
+    # band is the edge: redraw it as the clean mix, no partial leftovers
+    gate = np.maximum(gate, cover * ((dist_a + dist_b) <= 0.75 * band))
+    if DEBUG is not None:
+        DEBUG.update(ys=ys, xs=xs, fit=fit, gate=gate, cover=cover, off=off, alpha=alpha,
+                     mixed=mixed, steep=steep, dist_a=dist_a, dist_b=dist_b, inside=inside[ys, xs],
+                     a=a_, b=b_, clean=clean, seen=seen, labels=labels)
     wmap = np.zeros((h, w), np.float32)
     # Fade with distance from the colours painted, as the main blend does,
     # so plain paper further out is not painted where its neighbours are not.
