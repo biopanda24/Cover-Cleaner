@@ -230,3 +230,32 @@ def test_release_notes_from_changelog():
     assert notes.strip() and "\n## " not in notes and "CHANGELOG.md" in notes
     with pytest.raises(SystemExit):
         build.release_notes("999.0.0")
+
+
+def test_helper_works_out_uv_gpu_and_python_from_a_bom_manifest(tmp_path, monkeypatch):
+    """What 0.5.0-0.5.2 send: no --uv, no --gpu, pythonw.exe; install.json with a BOM."""
+    root, new, py, uv = _layout_with_venv(tmp_path, new_python="3.10.22")
+    (py.parent / "pythonw.exe").write_text("")
+    (new / "requirements-gpu.lock").write_text("")
+    manifest = {"version": "0.1.0", "gpu": True, "uv": os.path.join("bin", "uv.exe" if os.name == "nt" else "uv"),
+                "python_version": "3.10.22"}
+    (root / "install.json").write_bytes(b"\xef\xbb\xbf" + json.dumps(manifest).encode())
+    if os.name != "nt":
+        uv.rename(uv.with_name("uv"))
+        uv = uv.with_name("uv")
+    cmds = _simulate(monkeypatch, have="3.10.22")
+    args = ["--pid", str(_finished_pid()), "--source", str(new), "--target", str(root / "app"),
+            "--root", str(root), "--python", str(py.parent / "pythonw.exe"), "--version", "0.2.0",
+            "--no-relaunch"]
+    assert update_helper.main(args) == 0
+    assert [c[0] for c in cmds] == [str(uv), str(uv)]                 # uv, not pip
+    assert cmds[0][4] == str(py)                                      # python.exe
+    assert cmds[1][-1].endswith("requirements-gpu.lock")              # GPU kept
+    info = json.loads((root / "install.json").read_text(encoding="utf-8"))
+    assert info["version"] == "0.2.0" and info["gpu"] and info["uv"]  # nothing lost
+
+
+def test_manifest_reads_bom(tmp_path, monkeypatch):
+    (tmp_path / "install.json").write_bytes(b"\xef\xbb\xbf" + b'{"gpu": true}')
+    monkeypatch.setattr(updater, "install_root", lambda: str(tmp_path))
+    assert updater.manifest() == {"gpu": True}

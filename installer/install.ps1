@@ -92,7 +92,9 @@ try {
     $manifest = [ordered]@{ version = $Version; models = [bool]$Models; gpu = [bool]$Gpu;
                             python = "venv\Scripts\python.exe"; python_version = $PythonVersion;
                             uv = "bin\uv.exe"; uv_version = $UvVersion }
-    $manifest | ConvertTo-Json | Set-Content -Encoding UTF8 "$InstallDir\install.json"
+    # UTF-8 without a BOM (Set-Content -Encoding UTF8 adds one in Windows PowerShell 5.1)
+    [IO.File]::WriteAllText("$InstallDir\install.json", ($manifest | ConvertTo-Json),
+                            (New-Object Text.UTF8Encoding $false))
 
     if ($Shortcuts) {
         $ws = New-Object -ComObject WScript.Shell

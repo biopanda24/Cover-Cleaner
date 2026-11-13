@@ -3,6 +3,16 @@
 Version numbers follow semantic versioning: the minor number goes up for
 new features, the patch number for fixes.
 
+## 0.5.3 - 2026-11-13
+
+- *Update now* failed on Windows installs: the program closed and started
+  again without updating. The Windows installer writes `install.json` with
+  a byte-order mark, which the updater could not read, so it did not find
+  uv (or that GPU support was installed) and the package install failed.
+  The update helper now reads it correctly and works out uv, GPU support
+  and the right Python itself, so installed 0.5.0-0.5.2 copies can update
+  to this version. New installs write `install.json` without the mark.
+
 ## 0.5.2 - 2026-11-13
 
 - The new-version window shows what changed: the release notes appear

@@ -114,7 +114,8 @@ def manifest() -> dict:
     if not root:
         return {}
     try:
-        with open(os.path.join(root, "install.json"), encoding="utf8") as fh:
+        # utf-8-sig: Windows PowerShell 5.1 (the Windows installer) writes a BOM
+        with open(os.path.join(root, "install.json"), encoding="utf-8-sig") as fh:
             return json.load(fh)
     except (OSError, ValueError):
         return {}
@@ -233,6 +234,9 @@ def start_update(new_app: str, version: str) -> None:
         raise UpdateError("not an installed copy")
     info = manifest()
     py = sys.executable
+    if os.path.basename(py).lower() == "pythonw.exe":       # the GUI runs windowless
+        console = os.path.join(os.path.dirname(py), "python.exe")
+        py = console if os.path.isfile(console) else py
     helper_src = os.path.join(new_app, "covercleaner", "update_helper.py")
     if not os.path.isfile(helper_src):                  # older archive: use ours
         helper_src = os.path.join(app_dir(), "covercleaner", "update_helper.py")

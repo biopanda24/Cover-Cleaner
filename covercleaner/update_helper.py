@@ -153,7 +153,43 @@ def _relaunch(a, target: str) -> None:
                      start_new_session=(sys.platform != "win32"))
 
 
+def _read_manifest(root: str) -> dict:
+    """install.json; utf-8-sig because Windows PowerShell 5.1 writes a BOM."""
+    try:
+        with open(os.path.join(root, "install.json"), encoding="utf-8-sig") as fh:
+            info = json.load(fh)
+        return info if isinstance(info, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _console_python(py: str) -> str:
+    """python.exe rather than pythonw.exe (which has no output to read)."""
+    d, name = os.path.split(py)
+    if name.lower() == "pythonw.exe" and os.path.isfile(os.path.join(d, "python.exe")):
+        return os.path.join(d, "python.exe")
+    return py
+
+
+def _fill_in(a) -> None:
+    """Work out what the program that started this helper may not have
+    passed: older versions read install.json wrongly (BOM) and so sent no
+    uv and no GPU flag, and passed pythonw.exe."""
+    info = _read_manifest(a.root)
+    a.python = _console_python(a.python)
+    if not _has_uv(a):
+        names = [info.get("uv") or "", os.path.join("bin", "uv.exe"), os.path.join("bin", "uv")]
+        for n in names:
+            path = os.path.join(a.root, n) if n else ""
+            if path and os.path.isfile(path):
+                a.uv = path
+                break
+    if info.get("gpu"):
+        a.gpu = True
+
+
 def run(a) -> int:
+    _fill_in(a)
     target = os.path.abspath(a.target)
     backup = target + ".old"
     _log(a.root, f"update to {a.version}: waiting for the program to close")
@@ -201,11 +237,7 @@ def run(a) -> int:
                 installing_in_place = True
                 _install_requirements(a, target, a.python)
         mf = os.path.join(a.root, "install.json")
-        try:
-            with open(mf, encoding="utf8") as fh:
-                info = json.load(fh)
-        except (OSError, ValueError):
-            info = {}
+        info = _read_manifest(a.root)
         info["version"] = a.version
         if want and not a.no_install:
             info["python_version"] = want
