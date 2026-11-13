@@ -207,6 +207,7 @@ def main(argv=None) -> int:
                     help="build the Windows zip installer even if Inno Setup is available")
     a = ap.parse_args(argv)
     v = version()
+    a.out = os.path.abspath(a.out)                 # Inno Setup resolves relative paths from the .iss
     os.makedirs(a.out, exist_ok=True)
     files = app_files()
     print(f"Cover Cleaner {v}: {len(files)} files")

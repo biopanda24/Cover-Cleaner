@@ -3,6 +3,13 @@
 Version numbers follow semantic versioning: the minor number goes up for
 new features, the patch number for fixes.
 
+## 0.5.1 - 2026-11-13
+
+- The release build on GitHub failed: `installer/build.py --out dist` gave
+  Inno Setup relative paths, which it reads from the .iss file's folder.
+  The output folder is now always made absolute.
+- GitHub Actions updated to versions that run on Node.js 24.
+
 ## 0.5.0 - 2026-11-13
 
 - Program icon: a cover being wiped clean, halftoned and grimy on one side
