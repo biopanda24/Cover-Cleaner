@@ -6,10 +6,13 @@ a neural network trained to continue texture and structure through a hole,
 so repairs inside photos, hair, fabric or patterns look natural.
 
 The model file comes from OpenCV's model zoo
-(huggingface.co/opencv/inpainting_lama, Apache-2.0) and runs with OpenCV's
-own DNN module, so no extra framework is needed.  It works on 512x512
-windows; each window is cut at native resolution around a defect so no
-detail is lost to resizing.
+(huggingface.co/opencv/inpainting_lama, Apache-2.0).  With onnxruntime-gpu
+installed it runs on an NVIDIA GPU (CUDA), from a float32 copy of the model
+written once next to the original (its weights are block-quantized, which
+the CUDA provider cannot run); otherwise it runs on the CPU with OpenCV's
+DNN module.  Set COVERCLEANER_DEVICE=cpu to force the CPU.  It works on
+512x512 windows; each window is cut at native resolution around a defect
+so no detail is lost to resizing.
 """
 from __future__ import annotations
 
@@ -24,7 +27,8 @@ MODEL_FILE = "inpainting_lama_2025jan.onnx"
 MODEL_URL = "https://huggingface.co/opencv/inpainting_lama/resolve/main/" + MODEL_FILE
 SIZE = 512
 
-_net = None
+_net = None          # cv2.dnn.Net, or an onnxruntime InferenceSession on the GPU
+_gpu = False
 _lock = threading.Lock()
 
 
@@ -38,14 +42,74 @@ def available() -> bool:
     return os.path.isfile(model_path())
 
 
+def float_model_path() -> str:
+    return os.path.splitext(model_path())[0] + ".float.onnx"
+
+
+def gpu_usable() -> bool:
+    """Whether LaMa can run on the GPU here (without loading it)."""
+    if os.environ.get("COVERCLEANER_DEVICE", "").lower() == "cpu":
+        return False
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        return False
+    return "CUDAExecutionProvider" in ort.get_available_providers()
+
+
+def gpu_free_mb() -> int:
+    """Free memory on the first NVIDIA GPU in MB, or 0 if unknown."""
+    import subprocess
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10).stdout
+        return int(out.split()[0])
+    except Exception:
+        return 0
+
+
+def _gpu_session():
+    """An onnxruntime CUDA session for the float model, or None."""
+    if not gpu_usable():
+        return None
+    import onnxruntime as ort
+    try:
+        if hasattr(ort, "preload_dlls"):
+            ort.preload_dlls()                  # CUDA / cuDNN from the nvidia-* wheels
+        path = float_model_path()
+        if not os.path.isfile(path):
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            from tools.lama_float import convert  # needs the 'onnx' package
+            convert(model_path(), path + ".tmp")
+            os.replace(path + ".tmp", path)
+        so = ort.SessionOptions()
+        so.log_severity_level = 3
+        cuda = {"arena_extend_strategy": "kSameAsRequested"}
+        sess = ort.InferenceSession(path, so, providers=[("CUDAExecutionProvider", cuda)])
+        return sess if "CUDAExecutionProvider" in sess.get_providers() else None
+    except Exception:
+        return None
+
+
 def _load():
-    global _net
+    global _net, _gpu
     if _net is None:
         if not available():
             raise FileNotFoundError(
                 f"ML model not found: {model_path()}\nDownload {MODEL_URL} into that folder.")
-        _net = cv2.dnn.readNetFromONNX(model_path())
+        sess = _gpu_session()
+        if sess is not None:
+            _net, _gpu = sess, True
+        else:
+            _net, _gpu = cv2.dnn.readNetFromONNX(model_path()), False
     return _net
+
+
+def device() -> str:
+    """Where LaMa runs: "GPU (CUDA)" or "CPU" (loads the model)."""
+    _load()
+    return "GPU (CUDA)" if _gpu else "CPU"
 
 
 def _infer(patch: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -55,9 +119,12 @@ def _infer(patch: np.ndarray, mask: np.ndarray) -> np.ndarray:
     hole = (mask > 0).astype(np.float32)
     # the network expects the hole to be blanked out
     blob = (rgb * (1.0 - hole[:, :, None])).transpose(2, 0, 1)[None].astype(np.float32)
-    net.setInput(blob, "image")
-    net.setInput(hole[None, None], "mask")
-    out = net.forward()[0].transpose(1, 2, 0)            # RGB, 0..255
+    if _gpu:
+        out = net.run(None, {"image": blob, "mask": hole[None, None]})[0][0].transpose(1, 2, 0)
+    else:
+        net.setInput(blob, "image")
+        net.setInput(hole[None, None], "mask")
+        out = net.forward()[0].transpose(1, 2, 0)        # RGB, 0..255
     return np.clip(out[:, :, ::-1] / 255.0, 0.0, 1.0).astype(np.float32)
 
 

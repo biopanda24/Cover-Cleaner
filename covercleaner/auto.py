@@ -29,7 +29,8 @@ def auto_params(source: np.ndarray, progress: Progress = None,
         report.append("ML pipeline selected but the model file is missing "
                       f"({ml.model_path()}); using traditional repairs.")
     elif mode == "ml":
-        report.append("Pipeline: ML (neural inpainting for defects inside textured areas).")
+        report.append("Pipeline: ML (neural inpainting for defects inside textured areas, "
+                      f"on the {'GPU' if ml.gpu_usable() else 'CPU'}).")
     else:
         report.append("Pipeline: Traditional.")
     pipe = pipeline or Pipeline(source)

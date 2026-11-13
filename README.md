@@ -49,7 +49,8 @@ switches between:
 Measured on these scans by hiding real picture content under artificial
 defects and comparing the fill with the original (mean error, 0-255): city
 photo 11.9 -> 4.3, tape photo 8.1 -> 4.2, leaf collage 6.6 -> 2.6. ML is
-slower: about 2 s per 512 px window on the CPU.
+slower on the CPU (about 3 s per 512 px window); on an NVIDIA GPU it takes
+about 0.16 s (see below).
 
 ML needs one model file, `models/inpainting_lama_2025jan.onnx` (92.6 MB,
 Apache-2.0), from OpenCV's model zoo:
@@ -57,6 +58,23 @@ Apache-2.0), from OpenCV's model zoo:
 module (OpenCV 5), so no other framework is required. Without the file the
 ML option is greyed out and everything falls back to Traditional. ML is the
 default whenever the file is present.
+
+**GPU (optional, NVIDIA):** with ONNX Runtime's CUDA build installed,
+
+```
+.venv\Scripts\python -m pip install "onnxruntime-gpu[cuda]==1.23.2" "nvidia-cudnn-cu12==9.10.2.21" onnx
+```
+
+LaMa runs on the GPU, about 20 times faster than on the CPU. On first use
+a float32 copy of the model is written next to it
+(`inpainting_lama_2025jan.float.onnx`, 210 MB): the original stores
+block-quantized weights the CUDA provider cannot run, and its shape
+arithmetic is folded to constants so the whole network stays on the GPU
+(`tools/lama_float.py`). cuDNN is pinned to 9.10: the 9.2x builds fail to
+initialise with onnxruntime-gpu 1.23. Results match the CPU path to within
+1% in the repaired pixels. Batch runs then use about 1.9 GB of GPU memory
+per scan processed at once, which caps the default `-j`. Set
+`COVERCLEANER_DEVICE=cpu` to force the CPU.
 
 Descreening is traditional in both modes: no descreening network from a
 trustworthy source was found.

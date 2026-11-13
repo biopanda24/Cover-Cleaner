@@ -41,10 +41,11 @@ def _out_path(src: str, out: str | None, many: bool, fmt: str) -> str:
     return os.path.join(folder, f"{base}.{fmt}")
 
 
-def default_jobs(n_files: int) -> int:
+def default_jobs(n_files: int, gpu: bool = False) -> int:
     """Scans processed at once: about one per four CPU threads (each scan
-    still uses a few threads inside OpenCV), and at most one per ~3 GB of
-    memory, which a large scan with its cached stages can use."""
+    still uses a few threads inside OpenCV), at most one per ~3 GB of
+    memory, which a large scan with its cached stages can use, and - when
+    ML inpainting runs on the GPU - one per ~1.9 GB of free GPU memory."""
     cpus = os.cpu_count() or 1
     jobs = max(1, cpus // 4)
     try:
@@ -61,6 +62,10 @@ def default_jobs(n_files: int) -> int:
             jobs = min(jobs, max(1, int(m.avail / 3e9)))
     except Exception:
         pass
+    if gpu:
+        free = ml.gpu_free_mb()
+        if free:
+            jobs = min(jobs, max(1, int((free - 500) / 1900)))
     return max(1, min(jobs, n_files))
 
 
@@ -145,7 +150,8 @@ def main(argv: list[str] | None = None) -> int:
     opts = dict(pipeline=args.pipeline, scale=args.scale, analyze_only=args.analyze_only,
                 output=args.output, many=len(files) > 1, format=args.format, bits=args.bits,
                 save_params=args.save_params)
-    jobs = args.jobs if args.jobs > 0 else default_jobs(len(files))
+    mode = args.pipeline or ("ml" if ml.available() else "traditional")
+    jobs = args.jobs if args.jobs > 0 else default_jobs(len(files), mode == "ml" and ml.gpu_usable())
     jobs = max(1, min(jobs, len(files)))
     t_start = time.time()
     failed = 0
