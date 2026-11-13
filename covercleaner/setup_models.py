@@ -111,6 +111,16 @@ def setup_models(force: bool = False) -> bool:
     return ok
 
 
+def gpu_requirements() -> list[str]:
+    """Installer arguments for GPU support: the hash-locked versions when the
+    lock file is there (installed copies), else GPU_PACKAGES."""
+    from . import updater
+    lock = os.path.join(updater.app_dir(), "requirements-gpu.lock")
+    if os.path.isfile(lock):
+        return ["--require-hashes", "-r", lock]
+    return list(GPU_PACKAGES)
+
+
 def _installer_cmd() -> list[str]:
     """uv (as used by the installers) if available, else pip of this Python."""
     uv = os.environ.get("COVERCLEANER_UV") or shutil.which("uv")
@@ -131,7 +141,7 @@ def setup_gpu() -> bool:
         print("  GPU support: no NVIDIA GPU found (nvidia-smi); skipped. ML runs on the CPU.")
         return True
     print("  Installing NVIDIA GPU support (onnxruntime-gpu, CUDA and cuDNN; about 1.5 GB)…")
-    r = subprocess.run(_installer_cmd() + GPU_PACKAGES)
+    r = subprocess.run(_installer_cmd() + gpu_requirements())
     if r.returncode != 0:
         print("  FAILED to install the GPU packages; ML will run on the CPU.")
         return False

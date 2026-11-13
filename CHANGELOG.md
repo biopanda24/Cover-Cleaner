@@ -3,6 +3,27 @@
 Version numbers follow semantic versioning: the minor number goes up for
 new features, the patch number for fixes.
 
+## 0.4.1 - 2026-11-13
+
+Installs are self-contained and reproducible:
+
+- Each install has its own Python 3.10.22 in its folder: never the
+  system's, not on PATH or in the registry, removed when uninstalling.
+  The uv version that sets it up is pinned too.
+- Packages are installed from `requirements.lock` /
+  `requirements-gpu.lock`: exact versions with SHA-256 checksums, the
+  versions the tests ran with (`installer/lock.py` writes them).
+- Only the Qt parts Cover Cleaner uses are installed (PySide6-Essentials):
+  about 460 MB less than the full PySide6.
+- Updates install the new release's locked packages; if a release moves
+  to a different Python, a new environment is built beside the old one
+  and swapped in. A failed update also puts the previous package versions
+  back. The update helper runs from the base Python so the environment
+  can be replaced.
+- GitHub Actions runs the tests on Windows, Linux and macOS with exactly
+  the shipped Python and packages, on every push; installers are only
+  built when they pass.
+
 ## 0.4.0 - 2026-11-13
 
 Installers and updates:

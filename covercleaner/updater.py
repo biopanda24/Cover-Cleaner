@@ -200,6 +200,23 @@ def _gui_python(py: str) -> str:
     return py
 
 
+def base_python() -> str:
+    """The Python the environment was made from (the helper runs from it, so
+    the environment itself can be replaced)."""
+    cfg = os.path.join(sys.prefix, "pyvenv.cfg")
+    try:
+        with open(cfg, encoding="utf8") as fh:
+            home = next((ln.split("=", 1)[1].strip() for ln in fh
+                         if ln.split("=", 1)[0].strip().lower() == "home"), "")
+    except OSError:
+        home = ""
+    names = ("python.exe",) if sys.platform == "win32" else ("python3", "python")
+    for n in names:
+        if home and os.path.isfile(os.path.join(home, n)):
+            return os.path.join(home, n)
+    return sys.executable
+
+
 def _stage_of(new_app: str) -> str:
     """The update/<version> folder that download() unpacked `new_app` into."""
     d = os.path.abspath(new_app)
@@ -223,14 +240,14 @@ def start_update(new_app: str, version: str) -> None:
     helper = os.path.join(stage, "update_helper.py")
     shutil.copy2(helper_src, helper)                    # runs from outside the app folder
     uv = os.path.join(root, info.get("uv", "")) if info.get("uv") else ""
-    args = [_gui_python(py), helper, "--pid", str(os.getpid()), "--source", new_app,
+    args = [_gui_python(base_python()), helper, "--pid", str(os.getpid()), "--source", new_app,
             "--target", app_dir(), "--root", root, "--python", py, "--version", version,
             "--cleanup", stage]
     if uv and os.path.isfile(uv):
         args += ["--uv", uv]
     if info.get("gpu"):
         from .setup_models import GPU_PACKAGES
-        args += ["--extra"] + GPU_PACKAGES
+        args += ["--gpu", "--extra"] + GPU_PACKAGES
     flags = 0
     if sys.platform == "win32":
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP

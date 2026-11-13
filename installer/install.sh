@@ -13,7 +13,8 @@ set -euo pipefail
 APP_NAME="Cover Cleaner"
 VERSION="@VERSION@"
 OS_KIND="@OS@"                         # linux | macos
-PYTHON_VERSION="3.11"
+PYTHON_VERSION="@PYTHON@"              # exact version, private to this install
+UV_VERSION="@UV@"
 
 if [ "$OS_KIND" = "macos" ]; then
   DIR="$HOME/Library/Application Support/Cover Cleaner"
@@ -54,7 +55,8 @@ launcher_paths() {
 if [ "$UNINSTALL" = 1 ]; then
   launcher_paths
   say "Removing $APP_NAME from $DIR"
-  rm -rf "$DIR/app" "$DIR/app.old" "$DIR/venv" "$DIR/bin" "$DIR/update" "$DIR/install.json" \
+  rm -rf "$DIR/app" "$DIR/app.old" "$DIR/venv" "$DIR/venv.new" "$DIR/venv.old" "$DIR/python" \
+         "$DIR/bin" "$DIR/update" "$DIR/install.json" \
          "$DIR/cover-cleaner" "$DIR/uninstall.sh" "$DIR"/*.log
   rmdir "$DIR" 2>/dev/null || true
   if [ "$OS_KIND" = "macos" ]; then rm -rf "$APP_BUNDLE"; else rm -f "$BIN_LINK" "$DESKTOP"; fi
@@ -98,34 +100,42 @@ if [ -d "$DIR/app.old/models" ] && [ ! -d "$DIR/app/models" ]; then
 fi
 rm -rf "$DIR/app.old"
 
-# ---- Python and packages (via uv) -----------------------------------------
-if command -v uv >/dev/null 2>&1; then
-  UV="$(command -v uv)"
-else
-  UV="$DIR/bin/uv"
-  if [ ! -x "$UV" ]; then
-    say "Installing uv (Python package installer)..."
-    if command -v curl >/dev/null 2>&1; then FETCH="curl -LsSf"; else FETCH="wget -qO-"; fi
-    $FETCH https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$DIR/bin" UV_NO_MODIFY_PATH=1 INSTALLER_NO_MODIFY_PATH=1 sh
-  fi
+# ---- Python and packages (via uv, a fixed version kept in bin/) ----------
+UV="$DIR/bin/uv"
+HAVE=""
+if [ -x "$UV" ]; then HAVE="$("$UV" --version 2>/dev/null | awk '{print $2}')"; fi
+if [ "$HAVE" != "$UV_VERSION" ]; then
+  say "Installing uv $UV_VERSION (Python package installer)..."
+  if command -v curl >/dev/null 2>&1; then FETCH="curl -LsSf"; else FETCH="wget -qO-"; fi
+  $FETCH "https://astral.sh/uv/$UV_VERSION/install.sh" | env UV_INSTALL_DIR="$DIR/bin" UV_NO_MODIFY_PATH=1 INSTALLER_NO_MODIFY_PATH=1 sh
+  [ -x "$UV" ] || { say "uv could not be installed"; exit 1; }
 fi
+
+# Python lives in python/ inside the install folder: never the system's,
+# not on PATH, removed by the uninstaller.
+export UV_PYTHON_INSTALL_DIR="$DIR/python" UV_MANAGED_PYTHON=1 UV_PYTHON_INSTALL_BIN=0 UV_NO_CACHE=1
+
 say "Setting up Python $PYTHON_VERSION and the required packages (this can take a few minutes)..."
-"$UV" venv --python "$PYTHON_VERSION" --allow-existing "$DIR/venv"
 PY="$DIR/venv/bin/python"
-"$UV" pip install --python "$PY" -r "$DIR/app/requirements.txt"
+CURRENT=""
+if [ -x "$PY" ]; then CURRENT="$("$PY" -c 'import platform; print(platform.python_version())' 2>/dev/null || true)"; fi
+if [ "$CURRENT" != "$PYTHON_VERSION" ]; then
+  rm -rf "$DIR/venv"
+  "$UV" venv --python "$PYTHON_VERSION" "$DIR/venv"
+fi
+"$UV" pip install --python "$PY" --require-hashes -r "$DIR/app/requirements.lock"
 
 export PYTHONPATH="$DIR/app"
 export COVERCLEANER_UV="$UV"
 if [ "$MODELS" = 1 ]; then "$PY" -m covercleaner.setup_models --models || say "Some models could not be downloaded; run setup again later."; fi
 if [ "$GPU" = 1 ]; then "$PY" -m covercleaner.setup_models --gpu || say "GPU setup failed; ML will run on the CPU."; fi
 
-UV_REL="$UV"
-case "$UV" in "$DIR"/*) UV_REL="${UV#"$DIR"/}" ;; esac
-"$PY" - "$DIR/install.json" "$VERSION" "$MODELS" "$GPU" "$UV_REL" <<'PYEOF'
+"$PY" - "$DIR/install.json" "$VERSION" "$MODELS" "$GPU" "$PYTHON_VERSION" "$UV_VERSION" <<'PYEOF'
 import json, sys
-path, version, models, gpu, uv = sys.argv[1:6]
+path, version, models, gpu, pyver, uvver = sys.argv[1:7]
 json.dump({"version": version, "models": models == "1", "gpu": gpu == "1",
-           "python": "venv/bin/python", "uv": uv}, open(path, "w"), indent=2)
+           "python": "venv/bin/python", "python_version": pyver,
+           "uv": "bin/uv", "uv_version": uvver}, open(path, "w"), indent=2)
 PYEOF
 
 # ---- launchers ------------------------------------------------------------

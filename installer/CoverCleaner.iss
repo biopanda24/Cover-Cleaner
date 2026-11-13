@@ -39,6 +39,9 @@ Filename: "{app}\venv\Scripts\pythonw.exe"; Parameters: "-m covercleaner gui"; W
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\venv"
+Type: filesandordirs; Name: "{app}\venv.new"
+Type: filesandordirs; Name: "{app}\venv.old"
+Type: filesandordirs; Name: "{app}\python"
 Type: filesandordirs; Name: "{app}\app"
 Type: filesandordirs; Name: "{app}\app.old"
 Type: filesandordirs; Name: "{app}\bin"

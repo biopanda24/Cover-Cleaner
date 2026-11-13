@@ -20,9 +20,13 @@ Download the installer for your system from the
   `.command` file (if macOS blocks it: right-click > Open). Installs
   *Cover Cleaner* in `~/Applications`.
 
-Every installer sets up its own Python and packages (with
-[uv](https://docs.astral.sh/uv/); nothing is installed system-wide) and
-asks whether to also download - both recommended and on by default:
+Every installer is self-contained: it puts its own copy of Python (the
+exact version in `.python-version`) and the exact, checksum-verified
+package versions from `requirements.lock` inside the install folder, using
+a pinned version of [uv](https://docs.astral.sh/uv/). It never uses or
+changes a Python already on the computer, adds nothing to PATH, and the
+uninstaller removes everything. It asks whether to also download - both
+recommended and on by default:
 
 - the **ML models** (LaMa inpainting and the disc text models, about
   160 MB);
@@ -49,6 +53,20 @@ python installer/build.py                      all targets, into dist/
 python installer/build.py --targets linux,macos
 ```
 
+What gets installed is pinned in three places:
+
+- `.python-version` - the Python version;
+- `requirements.lock` and `requirements-gpu.lock` - every package, with
+  its SHA-256, for Windows, Linux and macOS. They are written by
+  `.venv\Scripts\python installer/lock.py` from the development
+  environment, so to upgrade a package: upgrade it in `.venv`, run the
+  tests, run `lock.py`. `requirements.txt` only lists what is needed;
+- `UV_VERSION` in `installer/build.py` (and the workflow) - uv.
+
+The workflow runs the tests on Windows, Linux and macOS with exactly that
+Python and those packages on every push, and builds the installers only
+if they pass.
+
 The Linux and macOS installers and the app archive used by updates can be
 built on any system. The Windows setup .exe needs
 [Inno Setup 6](https://jrsoftware.org/isinfo.php) (without it a zip with
@@ -72,7 +90,8 @@ limited by free memory); set the number with `-j`, e.g. `-j 1` for one at
 a time.
 
 From a source checkout, first-time setup: `python -m venv .venv` then
-`.venv\Scripts\python -m pip install -r requirements.txt`.
+`.venv\Scripts\python -m pip install --require-hashes -r requirements.lock`
+(the tested versions) and `pip install pytest` for the tests.
 
 ## What it fixes
 
@@ -280,7 +299,7 @@ covercleaner/
   setup_models.py   downloads the ML models / sets up GPU support
   net.py        HTTPS via the system certificate store
   gui/          PySide6 editor
-installer/      build.py and the Windows / Linux / macOS installer sources
+installer/      build.py, lock.py and the installer sources
 tests/          synthetic ground-truth and updater tests (pytest)
 tools/          batch_eval.py (Auto on a folder, in parallel, for review),
                 review_sheets.py (before/after sheets + decision table),

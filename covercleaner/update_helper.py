@@ -5,9 +5,14 @@ file outside the app folder, standard library only):
 
   1. wait for the program (--pid) to exit;
   2. move the app folder aside, copy the new one in, keep models/;
-  3. install the new requirements (plus GPU packages if they were set up);
-  4. on any failure put the old app folder back;
+  3. install the new locked requirements (plus GPU support if it was set
+     up); if the release pins a different Python, build a new environment
+     with it next to the old one and swap it in;
+  4. on any failure put the old app folder (and environment) back;
   5. start Cover Cleaner again.
+
+It runs from the base Python, not from inside the environment, so the
+environment can be replaced.
 
 Everything is logged to <root>/update.log.
 """
@@ -66,19 +71,72 @@ def _no_window() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-def _install_requirements(a, target: str) -> None:
-    req = os.path.join(target, "requirements.txt")
-    if a.uv and os.path.isfile(a.uv):
-        base = [a.uv, "pip", "install", "--python", a.python]
+def _uv_env(root: str) -> dict:
+    """Keep uv's Python inside the install folder (as the installers do)."""
+    return dict(os.environ, UV_PYTHON_INSTALL_DIR=os.path.join(root, "python"),
+                UV_MANAGED_PYTHON="1", UV_PYTHON_INSTALL_BIN="0",
+                UV_PYTHON_INSTALL_REGISTRY="0", UV_NO_CACHE="1")
+
+
+def _run(a, cmd) -> None:
+    r = subprocess.run(cmd, capture_output=True, text=True, creationflags=_no_window(),
+                       env=_uv_env(a.root))
+    _log(a.root, f"$ {' '.join(cmd)}\n{r.stdout[-3000:]}{r.stderr[-3000:]}")
+    if r.returncode != 0:
+        raise RuntimeError(f"{os.path.basename(cmd[0])} failed (exit {r.returncode})")
+
+
+def _has_uv(a) -> bool:
+    return bool(a.uv) and os.path.isfile(a.uv)
+
+
+def _install_requirements(a, target: str, python: str) -> None:
+    if _has_uv(a):
+        base = [a.uv, "pip", "install", "--python", python]
     else:
-        base = [a.python, "-m", "pip", "install"]
-    for cmd in (base + ["-r", req], base + list(a.extra) if a.extra else None):
-        if cmd is None:
-            continue
-        r = subprocess.run(cmd, capture_output=True, text=True, creationflags=_no_window())
-        _log(a.root, f"$ {' '.join(cmd)}\n{r.stdout[-3000:]}{r.stderr[-3000:]}")
-        if r.returncode != 0:
-            raise RuntimeError(f"installing requirements failed (exit {r.returncode})")
+        base = [python, "-m", "pip", "install"]
+    lock = os.path.join(target, "requirements.lock")
+    if os.path.isfile(lock):
+        _run(a, base + ["--require-hashes", "-r", lock])
+    else:                                               # older release
+        _run(a, base + ["-r", os.path.join(target, "requirements.txt")])
+    if a.gpu or a.extra:
+        gpu_lock = os.path.join(target, "requirements-gpu.lock")
+        if a.gpu and os.path.isfile(gpu_lock):
+            _run(a, base + ["--require-hashes", "-r", gpu_lock])
+        elif a.extra:
+            _run(a, base + list(a.extra))
+
+
+def _python_version(python: str) -> str:
+    try:
+        r = subprocess.run([python, "-c", "import platform; print(platform.python_version())"],
+                           capture_output=True, text=True, timeout=60,
+                           creationflags=_no_window())
+        return r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _wanted_python(target: str) -> str:
+    try:
+        with open(os.path.join(target, ".python-version"), encoding="utf8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _prune_pythons(root: str, keep: str) -> None:
+    """Remove private Pythons other than `keep` (and the one running this)."""
+    pdir = os.path.join(root, "python")
+    if not os.path.isdir(pdir):
+        return
+    running = os.path.realpath(sys.executable)
+    for name in os.listdir(pdir):
+        path = os.path.join(pdir, name)
+        if (name.startswith("cpython-") and not name.startswith(f"cpython-{keep}-")
+                and not running.startswith(os.path.realpath(path) + os.sep)):
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def _relaunch(a, target: str) -> None:
@@ -107,7 +165,10 @@ def run(a) -> int:
         if a.cleanup:
             shutil.rmtree(a.cleanup, ignore_errors=True)
         return 1
-    swapped = False
+    venv = os.path.dirname(os.path.dirname(os.path.abspath(a.python)))   # venv/Scripts/python
+    venv_new, venv_old = venv + ".new", venv + ".old"
+    swapped = venv_swapped = installing_in_place = False
+    want = ""
     try:
         if os.path.exists(backup):
             _retry(lambda: shutil.rmtree(backup))
@@ -119,8 +180,26 @@ def run(a) -> int:
             new = os.path.join(target, name)
             if os.path.isdir(old) and not os.path.exists(new):
                 _retry(lambda: os.replace(old, new))
+        want = _wanted_python(target)
+        have = _python_version(a.python)
         if not a.no_install:
-            _install_requirements(a, target)
+            if want and have and want != have and _has_uv(a):
+                _log(a.root, f"new Python {want} (was {have}): building a new environment")
+                shutil.rmtree(venv_new, ignore_errors=True)
+                _run(a, [a.uv, "venv", "--python", want, venv_new])
+                new_py = os.path.join(venv_new, os.path.relpath(os.path.abspath(a.python), venv))
+                _install_requirements(a, target, new_py)
+                if os.path.exists(venv_old):
+                    _retry(lambda: shutil.rmtree(venv_old))
+                _retry(lambda: os.replace(venv, venv_old))
+                venv_swapped = True
+                _retry(lambda: os.replace(venv_new, venv))
+            else:
+                if want and have and want != have:
+                    _log(a.root, f"release wants Python {want} but uv is missing; keeping {have}")
+                    want = have
+                installing_in_place = True
+                _install_requirements(a, target, a.python)
         mf = os.path.join(a.root, "install.json")
         try:
             with open(mf, encoding="utf8") as fh:
@@ -128,13 +207,26 @@ def run(a) -> int:
         except (OSError, ValueError):
             info = {}
         info["version"] = a.version
+        if want and not a.no_install:
+            info["python_version"] = want
         with open(mf, "w", encoding="utf8") as fh:
             json.dump(info, fh, indent=2)
         shutil.rmtree(backup, ignore_errors=True)
+        if venv_swapped:
+            shutil.rmtree(venv_old, ignore_errors=True)
+            _prune_pythons(a.root, want)
         _log(a.root, f"updated to {a.version}")
         ok = 0
     except Exception as exc:                            # roll back
         _log(a.root, f"update failed: {exc!r}; restoring the previous version")
+        shutil.rmtree(venv_new, ignore_errors=True)
+        if venv_swapped:
+            try:
+                if os.path.exists(venv):
+                    _retry(lambda: shutil.rmtree(venv))
+                _retry(lambda: os.replace(venv_old, venv))
+            except Exception as exc2:
+                _log(a.root, f"ROLLBACK FAILED: {exc2!r}; the previous environment is in {venv_old}")
         if swapped:
             try:
                 if os.path.exists(target):
@@ -144,6 +236,11 @@ def run(a) -> int:
                             os.replace(moved, os.path.join(backup, name))
                     _retry(lambda: shutil.rmtree(target))
                 _retry(lambda: os.replace(backup, target))
+                if installing_in_place:             # put the old exact packages back
+                    try:
+                        _install_requirements(a, target, a.python)
+                    except Exception as exc3:
+                        _log(a.root, f"could not restore the previous packages: {exc3!r}")
             except Exception as exc2:
                 _log(a.root, f"ROLLBACK FAILED: {exc2!r}; the previous version is in {backup}")
         ok = 1
@@ -165,6 +262,7 @@ def main(argv=None) -> int:
     ap.add_argument("--uv", default="")
     ap.add_argument("--cleanup", default="")
     ap.add_argument("--extra", nargs="*", default=[])
+    ap.add_argument("--gpu", action="store_true", help="GPU support was set up")
     ap.add_argument("--no-install", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--no-relaunch", action="store_true", help=argparse.SUPPRESS)
     return run(ap.parse_args(argv))

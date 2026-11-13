@@ -1,25 +1,60 @@
-# Builds the installers and publishes them as a GitHub release when a
-# version tag is pushed (git tag v0.4.0 && git push origin v0.4.0).
+# Tests on Windows, Linux and macOS; on a version tag (git tag v0.4.1 &&
+# git push origin v0.4.1) also builds the installers and publishes the release.
 # The in-app updater looks for the CoverCleaner-<version>-app.zip asset.
-name: installers
+name: tests and installers
 
 on:
   push:
-    tags: ["v*"]
-  workflow_dispatch:
+    branches: [main]                 # tests only
+    tags: ["v*"]                     # tests, then installers and the release
+  pull_request:
+  workflow_dispatch:                 # tests and installers (no release)
 
 permissions:
   contents: write
 
 jobs:
+  # The tests run on exactly what the installers set up: the pinned uv, the
+  # Python in .python-version and the hash-locked packages.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.6"          # keep in step with UV_VERSION in installer/build.py
+
+      - name: Python and the locked packages
+        shell: bash
+        env:
+          UV_MANAGED_PYTHON: "1"
+        run: |
+          uv venv --python "$(cat .python-version)" .venv
+          uv pip install --python .venv --require-hashes -r requirements.lock
+          uv pip install --python .venv pytest
+
+      - name: Tests
+        shell: bash
+        run: |
+          if [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=.venv/Scripts/python; fi
+          "$PY" -c "import platform; print('Python', platform.python_version())"
+          "$PY" -m pytest -q tests
+
   build:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5   # only runs build.py (standard library)
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Inno Setup
         shell: pwsh

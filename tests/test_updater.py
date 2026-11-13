@@ -126,3 +126,93 @@ def test_helper_rolls_back(tmp_path):
 def test_dev_checkout_cannot_self_update():
     ok, why = updater.can_update()
     assert not ok and why
+
+
+# ---- Python / environment handling (external commands simulated) ----------
+def _layout_with_venv(tmp_path, new_python="3.10.22", lock=True):
+    root, new = _fake_install(tmp_path)
+    (root / "app" / "requirements.txt").write_text("")
+    py = root / "venv" / "Scripts" / "python.exe"
+    py.parent.mkdir(parents=True)
+    py.write_text("")
+    (root / "venv" / "OLD").write_text("")
+    uv = root / "bin" / "uv.exe"
+    uv.parent.mkdir()
+    uv.write_text("")
+    (new / ".python-version").write_text(new_python + "\n")
+    if lock:
+        (new / "requirements.lock").write_text("")
+    return root, new, py, uv
+
+
+def _simulate(monkeypatch, have, fail_on=None):
+    cmds = []
+
+    def run(a, cmd):
+        cmds.append(cmd)
+        if cmd[1] == "venv":
+            d = pathlib.Path(cmd[-1])
+            (d / "Scripts").mkdir(parents=True)
+            (d / "Scripts" / "python.exe").write_text("")
+            (d / "NEW").write_text("")
+        if fail_on and fail_on(cmd):
+            raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(update_helper, "_run", run)
+    monkeypatch.setattr(update_helper, "_python_version", lambda py: have)
+    return cmds
+
+
+def _helper_args(root, new, py, uv):
+    return ["--pid", str(_finished_pid()), "--source", str(new), "--target", str(root / "app"),
+            "--root", str(root), "--python", str(py), "--version", "0.2.0", "--uv", str(uv),
+            "--no-relaunch"]
+
+
+def test_helper_new_python_builds_and_swaps_env(tmp_path, monkeypatch):
+    root, new, py, uv = _layout_with_venv(tmp_path)
+    cmds = _simulate(monkeypatch, have="3.10.6")
+    assert update_helper.main(_helper_args(root, new, py, uv)) == 0
+    assert (root / "venv" / "NEW").exists() and not (root / "venv.old").exists()
+    assert json.loads((root / "install.json").read_text())["python_version"] == "3.10.22"
+    assert cmds[0][1:4] == ["venv", "--python", "3.10.22"]
+    assert "--require-hashes" in cmds[1] and str(root / "venv.new") in cmds[1][4]
+
+
+def test_helper_failed_new_env_keeps_old_one(tmp_path, monkeypatch):
+    root, new, py, uv = _layout_with_venv(tmp_path)
+    _simulate(monkeypatch, have="3.10.6", fail_on=lambda c: c[1] == "pip")
+    assert update_helper.main(_helper_args(root, new, py, uv)) == 1
+    assert (root / "venv" / "OLD").exists() and not (root / "venv.new").exists()
+    assert '"0.1.0"' in (root / "app" / "covercleaner" / "__init__.py").read_text()
+    assert "python_version" not in json.loads((root / "install.json").read_text())
+
+
+def test_helper_same_python_failure_restores_old_packages(tmp_path, monkeypatch):
+    root, new, py, uv = _layout_with_venv(tmp_path, new_python="3.10.6")
+    fails = iter([True])
+    cmds = _simulate(monkeypatch, have="3.10.6", fail_on=lambda c: next(fails, False))
+    assert update_helper.main(_helper_args(root, new, py, uv)) == 1
+    assert not any(c[1] == "venv" for c in cmds)
+    assert cmds[0][-1].endswith("requirements.lock")         # the new release's lock failed
+    assert cmds[1][-1].endswith("requirements.txt")          # the old app's packages put back
+    assert '"0.1.0"' in (root / "app" / "covercleaner" / "__init__.py").read_text()
+
+
+def test_prune_pythons(tmp_path):
+    for name in ("cpython-3.10.6-windows-x86_64-none", "cpython-3.10.22-windows-x86_64-none"):
+        (tmp_path / "python" / name).mkdir(parents=True)
+    update_helper._prune_pythons(str(tmp_path), "3.10.22")
+    assert os.listdir(tmp_path / "python") == ["cpython-3.10.22-windows-x86_64-none"]
+
+
+def test_lock_covers_requirements():
+    root = pathlib.Path(__file__).resolve().parents[1]
+    lock = (root / "requirements.lock").read_text()
+    pinned = {ln.split("==")[0] for ln in lock.splitlines() if "==" in ln}
+    for ln in (root / "requirements.txt").read_text().splitlines():
+        name = ln.split("#")[0].strip()
+        if name:
+            base = name.split(">")[0].split("<")[0].split("=")[0].strip().lower().replace("_", "-")
+            assert base in pinned, f"{base} is not in requirements.lock - run installer/lock.py"
+    assert (root / ".python-version").read_text().strip() in lock

@@ -39,7 +39,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HERE = os.path.join(ROOT, "installer")
 # What goes into an installed copy (the program, not tests or dev tools).
 INCLUDE = ("covercleaner/", "tools/__init__.py", "tools/lama_float.py",
-           "requirements.txt", "README.md", "CHANGELOG.md", "LICENSE")
+           "requirements.txt", "requirements.lock", "requirements-gpu.lock",
+           ".python-version", "README.md", "CHANGELOG.md", "LICENSE")
+# uv, which installs Python and the packages, is pinned too (a release that
+# has been out for a while and knows the Python version in .python-version).
+UV_VERSION = "0.13.6"          # also in .github/workflows/installers.yml
 
 
 def version() -> str:
@@ -61,13 +65,23 @@ def app_files() -> list[str]:
              and "__pycache__" not in f and os.path.isfile(os.path.join(ROOT, f))]
     if "covercleaner/__init__.py" not in files:
         raise SystemExit("covercleaner/ not found - run from the repository")
+    for need in ("requirements.lock", "requirements-gpu.lock", ".python-version"):
+        if need not in files:
+            raise SystemExit(f"{need} is missing - run installer/lock.py")
     return sorted(files)
+
+
+def python_version() -> str:
+    return open(os.path.join(ROOT, ".python-version"), encoding="utf8").read().strip()
 
 
 def _template(name: str, v: str, **extra) -> str:
     text = open(os.path.join(HERE, name), encoding="utf8").read()
-    for k, val in dict(VERSION=v, **extra).items():
+    for k, val in dict(VERSION=v, PYTHON=python_version(), UV=UV_VERSION, **extra).items():
         text = text.replace(f"@{k}@", val)
+    left = re.findall(r"@[A-Z_]+@", text)
+    if left:
+        raise SystemExit(f"{name}: unfilled placeholders {sorted(set(left))}")
     return text
 
 

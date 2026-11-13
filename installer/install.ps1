@@ -12,7 +12,8 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $Version = "@VERSION@"
-$PythonVersion = "3.11"
+$PythonVersion = "@PYTHON@"            # exact version, private to this install
+$UvVersion = "@UV@"
 
 function Fail($msg) {
     Write-Host ""
@@ -46,24 +47,36 @@ try {
         Copy-Item -Force "$PSCommandPath" "$InstallDir\install.ps1" -ErrorAction SilentlyContinue
     }
 
-    # ---- uv (Python package installer) --------------------------------
-    $uv = (Get-Command uv -ErrorAction SilentlyContinue).Source
-    if (-not $uv) {
-        $uv = "$InstallDir\bin\uv.exe"
-        if (-not (Test-Path $uv)) {
-            Write-Host "Installing uv (Python package installer)..."
-            $env:UV_INSTALL_DIR = "$InstallDir\bin"
-            $env:UV_NO_MODIFY_PATH = "1"
-            $env:INSTALLER_NO_MODIFY_PATH = "1"
-            Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression
-            if (-not (Test-Path $uv)) { Fail "uv could not be installed" }
-        }
+    # ---- uv (Python package installer), a fixed version kept in bin\ ----
+    $uv = "$InstallDir\bin\uv.exe"
+    $have = ""
+    if (Test-Path $uv) { $have = (& $uv --version) -replace '^uv\s+(\S+).*$', '$1' }
+    if ($have -ne $UvVersion) {
+        Write-Host "Installing uv $UvVersion (Python package installer)..."
+        $env:UV_INSTALL_DIR = "$InstallDir\bin"
+        $env:UV_NO_MODIFY_PATH = "1"
+        $env:INSTALLER_NO_MODIFY_PATH = "1"
+        Invoke-RestMethod "https://astral.sh/uv/$UvVersion/install.ps1" | Invoke-Expression
+        if (-not (Test-Path $uv)) { Fail "uv could not be installed" }
     }
 
+    # Python lives in python\ inside the install folder: never the system's,
+    # not on PATH, not registered, removed by the uninstaller.
+    $env:UV_PYTHON_INSTALL_DIR = "$InstallDir\python"
+    $env:UV_MANAGED_PYTHON = "1"
+    $env:UV_PYTHON_INSTALL_BIN = "0"
+    $env:UV_PYTHON_INSTALL_REGISTRY = "0"
+    $env:UV_NO_CACHE = "1"
+
     Write-Host "Setting up Python $PythonVersion and the required packages (this can take a few minutes)..."
-    Run $uv @("venv", "--python", $PythonVersion, "--allow-existing", "$InstallDir\venv")
     $py = "$InstallDir\venv\Scripts\python.exe"
-    Run $uv @("pip", "install", "--python", $py, "-r", "$InstallDir\app\requirements.txt")
+    $current = ""
+    if (Test-Path $py) { $current = (& $py -c "import platform; print(platform.python_version())") }
+    if ($current -ne $PythonVersion) {
+        if (Test-Path "$InstallDir\venv") { Remove-Item -Recurse -Force "$InstallDir\venv" }
+        Run $uv @("venv", "--python", $PythonVersion, "$InstallDir\venv")
+    }
+    Run $uv @("pip", "install", "--python", $py, "--require-hashes", "-r", "$InstallDir\app\requirements.lock")
 
     $env:PYTHONPATH = "$InstallDir\app"
     $env:COVERCLEANER_UV = $uv
@@ -76,10 +89,9 @@ try {
         if ($LASTEXITCODE -ne 0) { Write-Host "GPU setup failed; ML will run on the CPU." }
     }
 
-    $uvRel = $uv
-    if ($uv.StartsWith("$InstallDir\")) { $uvRel = $uv.Substring($InstallDir.Length + 1) }
     $manifest = [ordered]@{ version = $Version; models = [bool]$Models; gpu = [bool]$Gpu;
-                            python = "venv\Scripts\python.exe"; uv = $uvRel }
+                            python = "venv\Scripts\python.exe"; python_version = $PythonVersion;
+                            uv = "bin\uv.exe"; uv_version = $UvVersion }
     $manifest | ConvertTo-Json | Set-Content -Encoding UTF8 "$InstallDir\install.json"
 
     if ($Shortcuts) {
