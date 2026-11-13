@@ -1027,17 +1027,44 @@ class MainWindow(QMainWindow):
         self._refresh_outline()
         self.request_render()
 
+    @staticmethod
+    def _prepare_dir(path: str) -> bool:
+        """Create a default output folder before a file dialog opens on it
+        (Windows' folder picker rejects a folder that does not exist yet).
+        True if it was created here."""
+        if os.path.isdir(path):
+            return False
+        try:
+            os.makedirs(path)
+            return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _drop_if_unused(path: str, created: bool, chosen: str) -> None:
+        """Remove a folder _prepare_dir made if the user did not use it."""
+        if not created:
+            return
+        if chosen and os.path.normcase(os.path.abspath(chosen)).startswith(
+                os.path.normcase(os.path.abspath(path))):
+            return
+        try:
+            os.rmdir(path)                        # only if still empty
+        except OSError:
+            pass
+
     def save_dialog(self):
         if self.result is None or self.busy or self.dirty:
             self.statusBar().showMessage("Still processing - try again in a moment.")
             return
         st = self.settings
         base = st.output_path(self.path)
-        os.makedirs(os.path.dirname(base), exist_ok=True)
+        created = self._prepare_dir(os.path.dirname(base))
         filters = {"png": "PNG (*.png)", "tif": "TIFF (*.tif)", "jpg": "JPEG (*.jpg)"}
         order = [st.format] + [k for k in filters if k != st.format]
         path, _ = QFileDialog.getSaveFileName(self, "Save result", base,
                                               ";;".join(filters[k] for k in order))
+        self._drop_if_unused(os.path.dirname(base), created, os.path.dirname(path) if path else "")
         if not path:
             return
         try:
@@ -1054,12 +1081,15 @@ class MainWindow(QMainWindow):
         if not files or self.busy:
             return
         start = self.settings.save_dir or os.path.join(self.folder, "restored")
+        created = self._prepare_dir(start)
         out = QFileDialog.getExistingDirectory(self, "Folder for the restored images", start)
+        if out:
+            src_dirs = {os.path.normcase(os.path.dirname(f)) for f in files}
+            if os.path.normcase(os.path.abspath(out)) in src_dirs:
+                out = os.path.join(out, "restored")   # never overwrite the scans
+        self._drop_if_unused(start, created, out)
         if not out:
             return
-        src_dirs = {os.path.normcase(os.path.dirname(f)) for f in files}
-        if os.path.normcase(os.path.abspath(out)) in src_dirs:
-            out = os.path.join(out, "restored")   # never overwrite the scans
         st = _settings.AppSettings.from_dict(self.settings.to_dict())
         st.pipeline = self._mode()                # what the toolbar shows now
         st.bits = int(self.bits.currentText())

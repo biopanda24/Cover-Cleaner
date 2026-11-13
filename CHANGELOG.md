@@ -3,6 +3,14 @@
 Version numbers follow semantic versioning: the minor number goes up for
 new features, the patch number for fixes.
 
+## 0.5.4 - 2026-11-13
+
+- *Auto-restore all*: choosing the suggested `restored` folder no longer
+  fails with "path does not exist" when the folder is new. It is created
+  before the folder picker opens, and removed again if you cancel or pick
+  a different folder.
+- *Save*: cancelling no longer leaves an empty `restored` folder behind.
+
 ## 0.5.3 - 2026-11-13
 
 - *Update now* failed on Windows installs: the program closed and started

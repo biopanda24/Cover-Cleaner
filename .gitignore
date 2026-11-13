@@ -9,3 +9,5 @@ output/
 models/
 References/
 dist/
+# design sketches (icon candidates etc.)
+design/
