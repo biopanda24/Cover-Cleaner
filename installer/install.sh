@@ -49,8 +49,10 @@ launcher_paths() {
   else
     BIN_LINK="$HOME/.local/bin/cover-cleaner"
     DESKTOP="${XDG_DATA_HOME:-$HOME/.local/share}/applications/cover-cleaner.desktop"
+    ICONS="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
   fi
 }
+ICON_SIZES="16 24 32 48 64 128 256 512"
 
 if [ "$UNINSTALL" = 1 ]; then
   launcher_paths
@@ -59,7 +61,12 @@ if [ "$UNINSTALL" = 1 ]; then
          "$DIR/bin" "$DIR/update" "$DIR/install.json" \
          "$DIR/cover-cleaner" "$DIR/uninstall.sh" "$DIR"/*.log
   rmdir "$DIR" 2>/dev/null || true
-  if [ "$OS_KIND" = "macos" ]; then rm -rf "$APP_BUNDLE"; else rm -f "$BIN_LINK" "$DESKTOP"; fi
+  if [ "$OS_KIND" = "macos" ]; then
+    rm -rf "$APP_BUNDLE"
+  else
+    rm -f "$BIN_LINK" "$DESKTOP"
+    for s in $ICON_SIZES; do rm -f "$ICONS/${s}x${s}/apps/cover-cleaner.png"; done
+  fi
   say "Done. Your options (settings.json) are kept in your user settings folder."
   exit 0
 fi
@@ -150,7 +157,8 @@ chmod +x "$DIR/uninstall.sh" 2>/dev/null || true
 
 launcher_paths
 if [ "$OS_KIND" = "macos" ]; then
-  mkdir -p "$APP_BUNDLE/Contents/MacOS"
+  mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
+  cp "$DIR/app/covercleaner/assets/icon.icns" "$APP_BUNDLE/Contents/Resources/icon.icns"
   cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -161,6 +169,7 @@ if [ "$OS_KIND" = "macos" ]; then
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleExecutable</key><string>cover-cleaner</string>
+  <key>CFBundleIconFile</key><string>icon.icns</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
@@ -174,12 +183,20 @@ EOF
 else
   mkdir -p "$(dirname "$BIN_LINK")" "$(dirname "$DESKTOP")"
   ln -sf "$DIR/cover-cleaner" "$BIN_LINK"
+  for s in $ICON_SIZES; do
+    mkdir -p "$ICONS/${s}x${s}/apps"
+    cp "$DIR/app/covercleaner/assets/icon_${s}.png" "$ICONS/${s}x${s}/apps/cover-cleaner.png"
+  done
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -t "$ICONS" 2>/dev/null || true
+  fi
   cat > "$DESKTOP" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Cover Cleaner
 Comment=Restore scanned CD, DVD, VHS and cassette covers
 Exec="$DIR/cover-cleaner" %F
+Icon=cover-cleaner
 Terminal=false
 Categories=Graphics;Photography;
 MimeType=image/png;image/jpeg;image/tiff;

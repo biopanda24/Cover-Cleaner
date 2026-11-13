@@ -1243,8 +1243,33 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Options saved. Auto uses them from the next run.")
 
 
+ASSETS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
+
+
+def app_icon():
+    """The program icon (tools/make_icon.py), in the sizes Qt picks from."""
+    from PySide6.QtCore import QSize
+    from PySide6.QtGui import QIcon
+    icon = QIcon()
+    for s in (16, 24, 32, 48, 64, 128, 256):
+        path = os.path.join(ASSETS, f"icon_{s}.png")
+        if os.path.isfile(path):
+            icon.addFile(path, QSize(s, s))
+    return icon
+
+
 def run_gui(paths=None) -> int:
+    if sys.platform == "win32":
+        # Its own taskbar entry and icon, instead of being grouped under Python.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Biopanda.CoverCleaner")
+        except (AttributeError, OSError):
+            pass
     app = QApplication.instance() or QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setDesktopFileName("cover-cleaner")        # matches the Linux .desktop file
+    app.setWindowIcon(app_icon())
     win = MainWindow()
     win.show()
     if isinstance(paths, str):

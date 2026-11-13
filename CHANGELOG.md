@@ -3,6 +3,15 @@
 Version numbers follow semantic versioning: the minor number goes up for
 new features, the patch number for fixes.
 
+## 0.5.0 - 2026-11-13
+
+- Program icon: a cover being wiped clean, halftoned and grimy on one side
+  and clean on the other. It is drawn by `tools/make_icon.py` with simpler
+  versions for small sizes, and used for the window, the Windows taskbar
+  (Cover Cleaner gets its own taskbar entry instead of Python's), the
+  setup program, Start menu and desktop shortcuts, Add/Remove Programs,
+  the Linux applications menu and the macOS app.
+
 ## 0.4.1 - 2026-11-13
 
 Installs are self-contained and reproducible:

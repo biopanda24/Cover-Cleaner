@@ -19,6 +19,8 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayName=Cover Cleaner
+UninstallDisplayIcon={app}\app\covercleaner\assets\icon.ico
+SetupIconFile=@PAYLOAD@\app\covercleaner\assets\icon.ico
 
 [Tasks]
 Name: "models"; Description: "Download the ML models (LaMa inpainting and disc text, about 160 MB) - recommended"
@@ -30,8 +32,8 @@ Source: "@PAYLOAD@\app\*"; DestDir: "{app}\app"; Flags: recursesubdirs createall
 Source: "@PAYLOAD@\install.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\Cover Cleaner"; Filename: "{app}\venv\Scripts\pythonw.exe"; Parameters: "-m covercleaner gui"; WorkingDir: "{app}\app"; Comment: "Restore scanned CD, DVD, VHS and cassette covers"
-Name: "{autodesktop}\Cover Cleaner"; Filename: "{app}\venv\Scripts\pythonw.exe"; Parameters: "-m covercleaner gui"; WorkingDir: "{app}\app"; Tasks: desktopicon
+Name: "{autoprograms}\Cover Cleaner"; Filename: "{app}\venv\Scripts\pythonw.exe"; Parameters: "-m covercleaner gui"; WorkingDir: "{app}\app"; IconFilename: "{app}\app\covercleaner\assets\icon.ico"; AppUserModelID: "Biopanda.CoverCleaner"; Comment: "Restore scanned CD, DVD, VHS and cassette covers"
+Name: "{autodesktop}\Cover Cleaner"; Filename: "{app}\venv\Scripts\pythonw.exe"; Parameters: "-m covercleaner gui"; WorkingDir: "{app}\app"; IconFilename: "{app}\app\covercleaner\assets\icon.ico"; AppUserModelID: "Biopanda.CoverCleaner"; Tasks: desktopicon
 
 [Run]
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install.ps1"" -InstallDir ""{app}"" {code:SetupFlags}"; StatusMsg: "Setting up Python, the packages and the chosen extras (this can take several minutes)..."; Flags: waituntilterminated

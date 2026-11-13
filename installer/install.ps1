@@ -101,6 +101,7 @@ try {
             $lnk.TargetPath = "$InstallDir\venv\Scripts\pythonw.exe"
             $lnk.Arguments = "-m covercleaner gui"
             $lnk.WorkingDirectory = "$InstallDir\app"
+            $lnk.IconLocation = "$InstallDir\app\covercleaner\assets\icon.ico,0"
             $lnk.Description = "Restore scanned CD, DVD, VHS and cassette covers"
             $lnk.Save()
         }

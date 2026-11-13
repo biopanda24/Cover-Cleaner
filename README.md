@@ -299,11 +299,13 @@ covercleaner/
   setup_models.py   downloads the ML models / sets up GPU support
   net.py        HTTPS via the system certificate store
   gui/          PySide6 editor
+  assets/       program icon (PNG sizes, .ico, .icns; from tools/make_icon.py)
 installer/      build.py, lock.py and the installer sources
 tests/          synthetic ground-truth and updater tests (pytest)
 tools/          batch_eval.py (Auto on a folder, in parallel, for review),
                 review_sheets.py (before/after sheets + decision table),
-                outline_check.py / edge_zoom.py (inspect detected outlines)
+                outline_check.py / edge_zoom.py (inspect detected outlines),
+                make_icon.py (draws the program icon in every format)
 ```
 
 `Scans/`, `output/` and `models/` are not tracked by git.
