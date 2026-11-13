@@ -411,3 +411,36 @@ def test_ml_inpainting_beats_diffusion_on_structure_and_matches_on_flat():
     b = pipe.run(p, upto="defects")
     assert np.abs(b - img)[sel].mean() < np.abs(a - img)[sel].mean()
     assert Params.from_json(p.to_json()).mode == "ml"
+
+
+def _stapled(picture: bool):
+    """A 300 dpi cream booklet with two grey staples at the left (spine) edge."""
+    from covercleaner import staples  # noqa: F401
+    n = 900
+    img = np.full((n, n, 3), (0.86, 0.95, 0.97), np.float32)
+    if picture:                              # colour changing along the spine
+        y = np.arange(n, dtype=np.float32)[:, None, None]
+        img = img * (0.88 + 0.12 * np.sin(y / 30.0)) * np.ones((1, n, 1), np.float32)
+    for y in (int(0.2 * n), int(0.78 * n)):
+        img[y:y + 142, 0:4] = 0.45          # 12 mm of silver-grey wire
+    return img
+
+
+def test_staples_found_and_filled_on_solid_colour():
+    from covercleaner import staples
+    img = _stapled(picture=False)
+    r = staples.detect(img, dpi=300)
+    assert r.side == 3 and len(r.staples) == 2 and all(s.solid for s in r.staples)
+    p = Params()
+    p.geometry.enabled = False
+    p.defects.patches = [list(s.box) for s in r.staples]
+    out = Pipeline(img).run(p, upto="defects")
+    assert np.abs(out[:, :8] - img[400:500, 40:48].mean(axis=(0, 1))).max() < 0.05
+    clean = np.full_like(img, (0.86, 0.95, 0.97))
+    assert not staples.detect(clean, dpi=300).staples
+
+
+def test_staples_over_picture_are_not_solid():
+    from covercleaner import staples
+    r = staples.detect(_stapled(picture=True), dpi=300)
+    assert r.side == 3 and r.staples and not all(s.solid for s in r.staples)

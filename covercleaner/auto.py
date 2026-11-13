@@ -11,7 +11,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from . import defects, descreen, flat, geometry, ml, ocr, shading, tone
+from . import defects, descreen, flat, geometry, ml, ocr, shading, staples, tone
 from .params import Params
 from .pipeline import Pipeline
 
@@ -93,6 +93,24 @@ def auto_params(source: np.ndarray, progress: Progress = None,
         else:
             report.append("  Which way up it goes is not checked (text models not installed); "
                           "use the rotate buttons if needed.")
+
+    elif det.has_background and g.rotate90 == 0:
+        # Staples at a booklet's spine: fill them in on solid colour, else
+        # trim that side just past them.
+        st = staples.detect(img, dpi)
+        if st.staples:
+            side = geometry.SIDE_NAMES[st.side]
+            if all(s.solid for s in st.staples):
+                p.defects.patches = [list(s.box) for s in st.staples]
+                report.append(f"Staples: {len(st.staples)} at the {side} edge on solid colour; "
+                              "filled in.")
+            else:
+                cut = int(np.ceil(max(s.depth for s in st.staples))) + 2
+                k = (1, 2, 3, 0)[st.side]          # trim order is left, top, right, bottom
+                g.trim[k] += cut
+                img = pipe.run(p, upto="geometry")
+                report.append(f"Staples: {len(st.staples)} at the {side} edge over the "
+                              f"picture; trimmed {cut} px more off that edge.")
 
     # ---- 2. halftone screen ----------------------------------------------
     step("Analysing print screen", 0.2)

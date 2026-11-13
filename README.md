@@ -21,7 +21,7 @@ Stages run in this order; each works on the output of the one before.
 
 | Stage | Problem | Method |
 |---|---|---|
-| Crop / deskew / flatten | scanner background, crooked scan, curved edges, unevenly lit lid | Background colour modelled per side from the image border (a lid that is darker along one side, e.g. lifted by a booklet spine, is not mistaken for cover), then each paper edge is located at full resolution (outermost sharp transition, stepping over the lid shadow) and fitted with a robust line or gentle curve. A Coons-patch remap maps the outline to a rectangle. |
+| Crop / deskew / flatten | scanner background, crooked scan, curved edges, unevenly lit lid | Background colour modelled per side from the image border (a lid that is darker along one side, e.g. lifted by a booklet spine, is not mistaken for cover), then each paper edge is located at full resolution (outermost sharp transition, stepping over the lid shadow) and fitted with a robust line. Covers are flat rectangles, so the outline is squared up (one rotation, no perspective); curved-edge flattening is available but off in Auto. |
 | Descreen | halftone dot pattern, rosette/moire | The averaged power spectrum reveals the screen frequencies; those are notched out, plus a low-pass just below the screen frequency. Solid lettering falls back to notch-only so it stays crisp. |
 | Edge shading | darker edges where paper lifted | Median of pixel-to-pixel log differences towards the edge measures the shadow independent of picture content. |
 | Dust / specks | dust, print voids | Small blobs that stand out from a median-filtered copy, sit on a uniform surrounding and are isolated; inpainted. |
@@ -95,8 +95,18 @@ where a mistake would damage the picture:
   A side without a trustworthy edge is kept parallel/perpendicular to the
   reliable sides (a cover is a rectangle).
 * Edges that cannot be seen at all (white cover on a white lid) are placed
-  from the CD booklet size, 120 mm, using the DPI stored in the scan. The
-  report says when this happened.
+  from the standard sizes - CD booklet 120 x 120 mm, slim-case insert
+  135.5 x 120 mm - using the DPI stored in the scan, then moved onto any
+  faint edge found near that guess. A reliable edge 2-6% off a standard
+  size is also checked against it. Faint tint changes (a pale cover on a
+  neutral lid) count as edges. The report says when this happened.
+* A thin rim at the edge (lid shadow, a slightly larger sheet, the disc
+  tray or another item under the jacket) is cropped off up to the straight
+  edge of the print: white rims up to 15 px, dark ones up to 20 px, neutral
+  or not-parallel ones up to 45 px, and items under the jacket up to 85 px.
+* Staples at a booklet's spine (thin silver lines 9-16 mm long right at the
+  edge, in a symmetric pair) are filled in when they sit on solid colour;
+  over a picture, that edge is trimmed just past them instead.
 * A cover running past one or two edges of the scan keeps those edges.
 * Discs (CD/DVD, recognised by shape and 120/80 mm size) are cropped square,
   everything outside the disc becomes white, and the disc is turned so its

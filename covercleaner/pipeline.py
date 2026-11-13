@@ -92,8 +92,10 @@ class Pipeline:
             if d.dust_dark or d.dust_bright:
                 mask = _defects.detect_dust(out, d.sensitivity, d.max_size,
                                             d.dust_dark, d.dust_bright)
-        # Hand-painted repairs apply even when automatic detection is off.
+        # Hand-painted repairs and patches apply even when detection is off.
         mask = cv2.bitwise_or(mask, self.heal_mask)
+        for x0, y0, x1, y1 in d.patches:
+            cv2.rectangle(mask, (int(x0), int(y0)), (int(x1), int(y1)), 255, -1)
         mask[self.protect_mask > 0] = 0
         self.defect_mask = mask
         if not mask.any():

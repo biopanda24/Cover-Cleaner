@@ -61,6 +61,9 @@ class DefectParams:
     glare: bool = False
     glare_strength: float = 1.0
     glare_sensitivity: float = 0.5
+    # Boxes [x0, y0, x1, y1] (geometry output pixels) always repaired, e.g.
+    # staples on solid colour.  Applied even when detection is off.
+    patches: list = field(default_factory=list)
 
 
 @dataclass
