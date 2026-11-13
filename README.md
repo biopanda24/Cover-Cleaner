@@ -12,6 +12,10 @@ CoverCleaner.bat Scans           open the editor on a folder
 .venv\Scripts\python -m covercleaner apply scan.png -p scan.json -o fixed.png
 ```
 
+`auto` processes several scans at once (about one per four CPU threads,
+limited by free memory); set the number with `-j`, e.g. `-j 1` for one at
+a time.
+
 First-time setup: `python -m venv .venv` then
 `.venv\Scripts\python -m pip install -r requirements.txt`.
 
