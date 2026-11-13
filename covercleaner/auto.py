@@ -20,10 +20,18 @@ Progress = Optional[Callable[[str, float], None]]
 
 def auto_params(source: np.ndarray, progress: Progress = None,
                 pipeline: Optional[Pipeline] = None,
-                mode: str = "traditional", dpi: float | None = None) -> tuple[Params, list[str]]:
-    """Return (Params, human readable report) for a scan."""
+                mode: str = "traditional", dpi: float | None = None,
+                flat_cleaner: bool = False, rules=None,
+                scale: float = 1.0) -> tuple[Params, list[str]]:
+    """Return (Params, human readable report) for a scan.
+
+    `flat_cleaner` lets Auto switch on the (Experimental) flat colour
+    cleanup when it finds flat artwork; `rules` (settings.AutoRules) switches
+    individual crop rules off; `scale` is the output resize factor.
+    """
     p = Params()
     p.mode = mode
+    p.output.scale = float(scale)
     report: list[str] = []
     if mode == "ml" and not ml.available():
         report.append("ML pipeline selected but the model file is missing "
@@ -41,7 +49,7 @@ def auto_params(source: np.ndarray, progress: Progress = None,
 
     # ---- 1. geometry -----------------------------------------------------
     step("Finding cover outline", 0.0)
-    det = geometry.detect_cover(source, dpi=dpi)
+    det = geometry.detect_cover(source, dpi=dpi, rules=rules)
     g = p.geometry
     if det.has_background:
         g.enabled = True
@@ -95,7 +103,7 @@ def auto_params(source: np.ndarray, progress: Progress = None,
             report.append("  Which way up it goes is not checked (text models not installed); "
                           "use the rotate buttons if needed.")
 
-    elif det.has_background and g.rotate90 == 0:
+    elif det.has_background and g.rotate90 == 0 and getattr(rules, "staples", True):
         # Staples at a booklet's spine: fill them in on solid colour, else
         # trim that side just past them.
         # where an edge was not seen (placed from the jacket size), the paper
@@ -181,14 +189,19 @@ def auto_params(source: np.ndarray, progress: Progress = None,
                      for c in main[:5])
     # Only for covers that are mostly solid-colour artwork; a photo with a
     # few even patches would be posterised.
-    if fr.coverage >= 0.5 and 1 <= len(main) <= 8:
+    if fr.coverage >= 0.5 and 1 <= len(main) <= 8 and flat_cleaner:
         fp.enabled = True
         report.append(f"Flat colours: {fr.coverage * 100:.0f}% of the cover is solid colour "
-                      f"({len(main)} main colours, R,G,B: {cols}); evening out.")
+                      f"({len(main)} main colours, R,G,B: {cols}); evening out "
+                      "(Experimental).")
+    elif fr.coverage >= 0.5 and 1 <= len(main) <= 8:
+        report.append(f"Flat colours: {fr.coverage * 100:.0f}% of the cover is solid colour "
+                      f"({len(main)} main colours). Flat colour cleanup (Experimental) is off "
+                      "in Options; enable it there, or here for this scan.")
     elif fr.coverage >= 0.05:
         report.append(f"Flat colours: {fr.coverage * 100:.0f}% looks like solid colour - not "
-                      "enough to be sure this is flat artwork. Enable 'Flat colour cleanup' "
-                      "if it is.")
+                      "enough to be sure this is flat artwork. Enable 'Flat colour cleanup "
+                      "(Experimental)' if it is.")
     else:
         report.append("Flat colours: none found (photographic cover); skipped.")
     img = pipe.run(p, upto="flat")

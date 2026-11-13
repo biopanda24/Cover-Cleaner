@@ -90,6 +90,37 @@ if it has at least 8 such characters and twice as many as any other turn.
 The recogniser reads Latin letters, digits and symbols; a disc with only
 Japanese text is left as it is.
 
+## Options
+
+*Settings > Options...* (Ctrl+,) in the editor. They are stored in
+`%APPDATA%\CoverCleaner\settings.json` and are also the defaults of the
+command line, whose flags override them for one run (`--format`, `--bits`,
+`--scale`, `--suffix`, `--[no-]save-params`, `--pipeline`, `--[no-]gpu`,
+`--[no-]flat`, `--dpi`, `-j`).
+
+* **Output:** default save location (a `restored` folder next to the
+  scans unless set), format, bit depth, JPEG quality, file name suffix,
+  overwrite or number new files (`name (2).png`), save the chosen settings
+  (.json) with each result, output scale.
+* **Processing:** default pipeline (automatic / ML / Traditional), use the
+  GPU for ML inpainting, scans processed at once (automatic or a number),
+  fallback DPI for scans that store none.
+* **Auto:** *use flat colour cleanup when flat sections are detected*
+  (**Experimental**, off by default - Auto then only reports flat artwork;
+  the fix can still be switched on per scan in the Fixes panel), and
+  switches for the crop rules: standard-size placement, white-border
+  restore, cropping things showing past one edge, staples.
+* **Models:** which model files are installed, and whether the GPU can be
+  used.
+* **About:** version and credits. *Help > About* shows the same.
+
+## Versions
+
+Cover Cleaner uses semantic versioning (see `CHANGELOG.md`): the minor
+number goes up for new features, the patch number for fixes. The version is
+shown in the window title, in *Help > About* and by
+`python -m covercleaner --version`.
+
 ## Auto mode
 
 Auto analyses the scan and only switches a fix on when it finds evidence for
@@ -99,8 +130,8 @@ where a mistake would damage the picture:
 * Dust is removed automatically only on flat colour. Dots inside photos
   (catch lights, reflections) are left alone - raise *Dust sensitivity* above
   0.75 or use the Heal brush.
-* Flat colour cleanup is switched on only when at least half the cover is
-  solid-colour artwork; on photo covers it would posterise even patches.
+* Flat colour cleanup (Experimental) is switched on only when allowed in
+  Options and at least half the cover is solid-colour artwork; on photo covers it would posterise even patches.
   Thin lettering (strokes under about 15 px) is too narrow to be detected
   as a flat area and is left as scanned. Use the Protect brush to exclude a
   spot, and *Tolerance* to make it more or less aggressive.

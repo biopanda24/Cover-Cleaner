@@ -444,3 +444,36 @@ def test_staples_over_picture_are_not_solid():
     from covercleaner import staples
     r = staples.detect(_stapled(picture=True), dpi=300)
     assert r.side == 3 and r.staples and not all(s.solid for s in r.staples)
+
+
+def test_settings_roundtrip_and_output_names(tmp_path, monkeypatch):
+    from covercleaner import settings
+    monkeypatch.setenv("COVERCLEANER_SETTINGS", str(tmp_path / "s.json"))
+    s = settings.load()
+    assert not s.flat_cleaner                        # Experimental: off by default
+    s.format, s.suffix, s.save_dir, s.rules.staples = "jpg", "_clean", str(tmp_path), False
+    settings.save(s)
+    t = settings.load()
+    assert (t.format, t.suffix, t.rules.staples) == ("jpg", "_clean", False)
+    first = t.output_path(str(tmp_path / "scan.png"))
+    assert first.endswith("scan_clean.jpg")
+    open(first, "w").close()
+    assert t.output_path(str(tmp_path / "scan.png")).endswith("scan_clean (2).jpg")
+    t.overwrite = True
+    assert t.output_path(str(tmp_path / "scan.png")) == first
+    assert t.dpi_for(None) == 600.0 and t.dpi_for(300.0) == 300.0
+
+
+def test_auto_leaves_flat_cleanup_off_unless_allowed():
+    cover = make_flat_cover() if "make_flat_cover" in globals() else None
+    if cover is None:
+        n = 600
+        cover = np.full((n, n, 3), (0.2, 0.3, 0.9), np.float32)
+        cv2.rectangle(cover, (0, n // 2), (n, n), (0.95, 0.95, 0.95), -1)
+        _text(cover, "FLAT", (60, 200), 4.0, 0.0, 12)
+        rng = np.random.default_rng(1)
+        cover = np.clip(cover + rng.normal(0, 0.02, cover.shape).astype(np.float32), 0, 1)
+    p_off, rep_off = auto_params(cover, pipeline=Pipeline(cover))
+    p_on, _ = auto_params(cover, pipeline=Pipeline(cover), flat_cleaner=True)
+    assert not p_off.flat.enabled and p_on.flat.enabled
+    assert any("Experimental" in r for r in rep_off)

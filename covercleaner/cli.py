@@ -1,6 +1,6 @@
 """Command line / batch interface.
 
-    python -m covercleaner auto  Scans/ -o output/   [-j 6]
+    python -m covercleaner auto  Scans/ -o output/   [-j 6] [--flat]
     python -m covercleaner apply scan.png -p scan.json -o fixed.png
     python -m covercleaner gui [image]
 """
@@ -31,14 +31,6 @@ def _collect(inputs: list[str]) -> list[str]:
             hits = sorted(glob.glob(item))
             files.extend(hits if hits else [item])
     return files
-
-
-def _out_path(src: str, out: str | None, many: bool, fmt: str) -> str:
-    base = os.path.splitext(os.path.basename(src))[0]
-    if out and not many and os.path.splitext(out)[1]:
-        return out
-    folder = out or os.path.join(os.path.dirname(os.path.abspath(src)), "restored")
-    return os.path.join(folder, f"{base}.{fmt}")
 
 
 def default_jobs(n_files: int, gpu: bool = False) -> int:
@@ -76,21 +68,28 @@ def _worker_init(threads: int) -> None:
 
 def _auto_one(path: str, opts: dict) -> tuple[str, bool]:
     """Analyse and restore one scan. Returns (report text, ok)."""
+    from . import settings as _settings
     t0 = time.time()
+    st = _settings.AppSettings.from_dict(opts["settings"])
+    ml.set_use_gpu(st.use_gpu)
     lines = [f"== {path}"]
     try:
         src = load_image(path)
         pipe = Pipeline(src)
-        mode = opts["pipeline"] or ("ml" if ml.available() else "traditional")
-        params, report = auto_params(src, pipeline=pipe, mode=mode, dpi=read_dpi(path))
-        params.output.scale = opts["scale"]
+        params, report = auto_params(src, pipeline=pipe, mode=st.mode(ml.available()),
+                                     dpi=st.dpi_for(read_dpi(path)), flat_cleaner=st.flat_cleaner,
+                                     rules=st.rules, scale=st.scale)
         lines += ["   " + line for line in report]
-        if opts["analyze_only"]:
+        if opts.get("analyze_only"):
             return "\n".join(lines), True
         result = pipe.run(params)
-        dst = _out_path(path, opts["output"], opts["many"], opts["format"])
-        save_image(dst, result, opts["bits"])
-        if opts["save_params"]:
+        out = opts.get("output")
+        if out and not opts.get("many") and os.path.splitext(out)[1]:
+            dst = out                                   # a single file named on the command line
+        else:
+            dst = st.output_path(path, out or None)
+        save_image(dst, result, st.bits, st.jpeg_quality)
+        if st.save_params:
             with open(os.path.splitext(dst)[0] + ".json", "w", encoding="utf8") as fh:
                 fh.write(params.to_json())
         lines.append(f"   -> {dst}  ({result.shape[1]} x {result.shape[0]}, "
@@ -101,25 +100,75 @@ def _auto_one(path: str, opts: dict) -> tuple[str, bool]:
         return "\n".join(lines), False
 
 
+def run_batch(files: list[str], st, output: str | None = None, analyze_only: bool = False,
+              emit=print, progress=None) -> int:
+    """Run Auto on `files` with options `st` (AppSettings); returns the number
+    that failed.  `emit` receives each scan's report as it finishes,
+    `progress(done, total)` the count."""
+    ml.set_use_gpu(st.use_gpu)
+    opts = dict(settings=st.to_dict(), output=output, many=len(files) > 1,
+                analyze_only=analyze_only)
+    mode = st.mode(ml.available())
+    jobs = st.jobs if st.jobs > 0 else default_jobs(len(files), mode == "ml" and ml.gpu_usable())
+    jobs = max(1, min(jobs, len(files)))
+    t_start = time.time()
+    failed = 0
+    if jobs == 1:
+        for k, path in enumerate(files, 1):
+            text, ok = _auto_one(path, opts)
+            emit(f"[{k}/{len(files)}] " + text if len(files) > 1 else text)
+            failed += not ok
+            if progress:
+                progress(k, len(files))
+    else:
+        threads = max(1, (os.cpu_count() or 1) // jobs)
+        emit(f"Processing {len(files)} scans, {jobs} at a time.")
+        with ProcessPoolExecutor(jobs, initializer=_worker_init, initargs=(threads,)) as ex:
+            futures = {ex.submit(_auto_one, path, opts): path for path in files}
+            for done, fut in enumerate(as_completed(futures), 1):
+                try:
+                    text, ok = fut.result()
+                except Exception as exc:          # a worker died (e.g. out of memory)
+                    text, ok = f"== {futures[fut]}\n   FAILED: {exc}", False
+                emit(f"[{done}/{len(files)}] " + text)
+                failed += not ok
+                if progress:
+                    progress(done, len(files))
+    emit(f"Done: {len(files) - failed} of {len(files)} scans in {time.time() - t_start:.0f}s"
+         + (f", {failed} failed." if failed else "."))
+    return failed
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="covercleaner", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    from . import __version__
+    ap.add_argument("--version", action="version", version=f"Cover Cleaner {__version__}")
     sub = ap.add_subparsers(dest="cmd")
 
-    a = sub.add_parser("auto", help="analyse and restore scans automatically")
+    a = sub.add_parser("auto", help="analyse and restore scans automatically",
+                       description="Defaults come from Options (the editor's Settings > "
+                                   "Options...); these flags override them for this run.")
     a.add_argument("inputs", nargs="+", help="image files, folders or wildcards")
     a.add_argument("-o", "--output", help="output folder (or file for a single input)")
-    a.add_argument("--format", default="png", choices=["png", "tif", "jpg"])
-    a.add_argument("--bits", type=int, default=8, choices=[8, 16])
-    a.add_argument("--scale", type=float, default=1.0, help="resize factor for the result")
-    a.add_argument("--save-params", action="store_true",
+    a.add_argument("--format", default=None, choices=["png", "tif", "jpg"])
+    a.add_argument("--bits", type=int, default=None, choices=[8, 16])
+    a.add_argument("--scale", type=float, default=None, help="resize factor for the result")
+    a.add_argument("--suffix", default=None, help="added to each file name, e.g. _clean")
+    a.add_argument("--save-params", action=argparse.BooleanOptionalAction, default=None,
                    help="write the chosen settings next to each result (.json)")
     a.add_argument("--analyze-only", action="store_true", help="report only, write nothing")
     a.add_argument("--pipeline", choices=["traditional", "ml"], default=None,
-                   help="ml uses neural inpainting for repairs (default: ml when the model "
-                        "file is present, else traditional)")
-    a.add_argument("-j", "--jobs", type=int, default=0,
-                   help="scans processed at once (default: from CPU threads and memory)")
+                   help="ml uses neural inpainting for repairs (default from Options: ml when "
+                        "the model file is present)")
+    a.add_argument("--gpu", action=argparse.BooleanOptionalAction, default=None,
+                   help="run ML inpainting on the GPU when available")
+    a.add_argument("--flat", action=argparse.BooleanOptionalAction, default=None,
+                   help="(Experimental) flat colour cleanup when flat sections are detected")
+    a.add_argument("--dpi", type=float, default=None,
+                   help="DPI to assume for scans that store none")
+    a.add_argument("-j", "--jobs", type=int, default=None,
+                   help="scans processed at once (0: from CPU threads and memory)")
 
     b = sub.add_parser("apply", help="apply saved settings (.json) to a scan")
     b.add_argument("input")
@@ -147,31 +196,15 @@ def main(argv: list[str] | None = None) -> int:
     if not files:
         print("No input images found.", file=sys.stderr)
         return 1
-    opts = dict(pipeline=args.pipeline, scale=args.scale, analyze_only=args.analyze_only,
-                output=args.output, many=len(files) > 1, format=args.format, bits=args.bits,
-                save_params=args.save_params)
-    mode = args.pipeline or ("ml" if ml.available() else "traditional")
-    jobs = args.jobs if args.jobs > 0 else default_jobs(len(files), mode == "ml" and ml.gpu_usable())
-    jobs = max(1, min(jobs, len(files)))
-    t_start = time.time()
-    failed = 0
-    if jobs == 1:
-        for path in files:
-            text, ok = _auto_one(path, opts)
-            print(text, flush=True)
-            failed += not ok
-    else:
-        threads = max(1, (os.cpu_count() or 1) // jobs)
-        print(f"Processing {len(files)} scans, {jobs} at a time.", flush=True)
-        with ProcessPoolExecutor(jobs, initializer=_worker_init, initargs=(threads,)) as ex:
-            futures = {ex.submit(_auto_one, path, opts): path for path in files}
-            for done, fut in enumerate(as_completed(futures), 1):
-                try:
-                    text, ok = fut.result()
-                except Exception as exc:          # a worker died (e.g. out of memory)
-                    text, ok = f"== {futures[fut]}\n   FAILED: {exc}", False
-                print(f"[{done}/{len(files)}] " + text, flush=True)
-                failed += not ok
-    print(f"Done: {len(files) - failed} of {len(files)} scans in {time.time() - t_start:.0f}s"
-          + (f", {failed} failed." if failed else "."), flush=True)
+    from . import settings as _settings
+    st = _settings.load()
+    for name, attr in (("format", "format"), ("bits", "bits"), ("scale", "scale"),
+                       ("suffix", "suffix"), ("save_params", "save_params"),
+                       ("pipeline", "pipeline"), ("gpu", "use_gpu"), ("flat", "flat_cleaner"),
+                       ("dpi", "fallback_dpi"), ("jobs", "jobs")):
+        val = getattr(args, name)
+        if val is not None:
+            setattr(st, attr, val)
+    failed = run_batch(files, st, args.output, args.analyze_only,
+                       emit=lambda t: print(t, flush=True))
     return 1 if failed else 0

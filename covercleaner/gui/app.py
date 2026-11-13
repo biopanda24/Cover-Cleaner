@@ -15,13 +15,17 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
                                QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
                                QSlider, QSpinBox, QToolButton, QVBoxLayout, QWidget)
 
+from .. import __version__
+from .. import cli as _cli
 from .. import descreen as _descreen
+from .. import settings as _settings
 from .. import geometry as _geometry
 from .. import ml as _ml
 from ..auto import auto_params
 from ..imageio import SUPPORTED, load_image, read_dpi, save_image
 from ..params import Params
 from ..pipeline import Pipeline
+from .options import APP_NAME, EXPERIMENTAL, AboutDialog, OptionsDialog
 from .view import ImageView, mask_pixmap, to_pixmap
 
 
@@ -121,7 +125,8 @@ GROUPS = [
       ("glare_sensitivity", "Glare sensitivity", 0, 1, 2, ""),
       ("glare_strength", "Glare strength", 0, 1.5, 2, "")],
      [("dust_dark", "Dark specks"), ("dust_bright", "Light specks"), ("glare", "Glare")]),
-    ("flat", "Flat colour cleanup",
+    ("flat", f"Flat colour cleanup {EXPERIMENTAL}",
+     "Experimental. Auto only switches it on when Options > Auto allows it. "
      "Paints areas that were one solid colour in the artwork (backgrounds, stripes, "
      "lettering) with a single even colour. Use the Protect brush to exclude a spot.",
      [("tolerance", "Tolerance", 0.01, 0.2, 3, "How uneven an area may be and still count as "
@@ -151,7 +156,9 @@ GROUPS = [
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cover Cleaner")
+        self.settings = _settings.load()
+        _ml.set_use_gpu(self.settings.use_gpu)
+        self.setWindowTitle(self._title())
         self.resize(1500, 950)
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(1)          # the pipeline is not re-entrant
@@ -175,6 +182,7 @@ class MainWindow(QMainWindow):
         self.view.picked.connect(self._picked)
 
         self._build_toolbar()
+        self._build_menus()
         self._build_files_dock()
         self._build_controls_dock()
         self._build_report_dock()
@@ -203,8 +211,8 @@ class MainWindow(QMainWindow):
             tb.addAction(a)
             return a
 
-        act("Open…", self.open_dialog, "Ctrl+O")
-        act("Open folder…", self.open_folder_dialog, "Ctrl+Shift+O")
+        self.act_open = act("Open…", self.open_dialog, "Ctrl+O")
+        self.act_open_folder = act("Open folder…", self.open_folder_dialog, "Ctrl+Shift+O")
         tb.addSeparator()
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Traditional", "ML"])
@@ -213,10 +221,9 @@ class MainWindow(QMainWindow):
             "ML: also uses a neural network (LaMa) to repair dust and Heal-brush strokes "
             "inside textured areas - better fills, but slower."
             + ("" if _ml.available() else "\n\nML model file not found:\n" + _ml.model_path()))
-        if _ml.available():
-            self.mode_combo.setCurrentIndex(1)
-        else:
+        if not _ml.available():
             self.mode_combo.model().item(1).setEnabled(False)
+        self.mode_combo.setCurrentIndex(1 if self.settings.mode(_ml.available()) == "ml" else 0)
         self.mode_combo.currentIndexChanged.connect(self._mode_changed)
         tb.addWidget(QLabel(" Pipeline: "))
         tb.addWidget(self.mode_combo)
@@ -227,7 +234,7 @@ class MainWindow(QMainWindow):
         self.act_save = act("Save result…", self.save_dialog, "Ctrl+S")
         self.act_batch = act("Auto-restore all…", self.batch_dialog, None,
                              "Run Auto on every file in the list and save the results")
-        act("Load settings…", self.load_settings)
+        self.act_load_settings = act("Load settings…", self.load_settings)
         self.act_save_settings = act("Save settings…", self.save_settings)
         tb.addSeparator()
         self.btn_original = QToolButton(); self.btn_original.setText("Original + outline")
@@ -400,6 +407,7 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.addWidget(QLabel("Bit depth"))
         self.bits = QComboBox(); self.bits.addItems(["8", "16"])
+        self.bits.setCurrentIndex(1 if self.settings.bits == 16 else 0)
         row.addWidget(self.bits); row.addStretch(1)
         lay.addLayout(row)
         col.addWidget(box)
@@ -524,7 +532,7 @@ class MainWindow(QMainWindow):
         self.params.mode = self._mode()
         self.result = None
         self.report.setPlainText("")
-        self.setWindowTitle(f"Cover Cleaner - {os.path.basename(path)}")
+        self.setWindowTitle(self._title(os.path.basename(path)))
         self._src_pixmap = to_pixmap(self.source)
         self._set_enabled(True)
         self.sync_controls()
@@ -570,9 +578,12 @@ class MainWindow(QMainWindow):
             return
         self.busy = True
         src, pipe, path, mode = self.source, self.pipe, self.path, self._mode()
+        st = self.settings
 
         def work(progress):
-            return path, auto_params(src, progress, pipe, mode, read_dpi(path))
+            return path, auto_params(src, progress, pipe, mode, st.dpi_for(read_dpi(path)),
+                                     flat_cleaner=st.flat_cleaner, rules=st.rules,
+                                     scale=st.scale)
 
         def done(res):
             self.busy = False
@@ -863,48 +874,48 @@ class MainWindow(QMainWindow):
         if self.result is None or self.busy or self.dirty:
             self.statusBar().showMessage("Still processing - try again in a moment.")
             return
-        folder = os.path.join(os.path.dirname(self.path), "restored")
-        base = os.path.join(folder, os.path.splitext(os.path.basename(self.path))[0] + ".png")
-        os.makedirs(folder, exist_ok=True)
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save result", base, "PNG (*.png);;TIFF (*.tif);;JPEG (*.jpg)")
+        st = self.settings
+        base = st.output_path(self.path)
+        os.makedirs(os.path.dirname(base), exist_ok=True)
+        filters = {"png": "PNG (*.png)", "tif": "TIFF (*.tif)", "jpg": "JPEG (*.jpg)"}
+        order = [st.format] + [k for k in filters if k != st.format]
+        path, _ = QFileDialog.getSaveFileName(self, "Save result", base,
+                                              ";;".join(filters[k] for k in order))
         if not path:
             return
         try:
-            save_image(path, self.result, int(self.bits.currentText()))
+            save_image(path, self.result, int(self.bits.currentText()), st.jpeg_quality)
+            if st.save_params:
+                with open(os.path.splitext(path)[0] + ".json", "w", encoding="utf8") as fh:
+                    fh.write(self.params.to_json())
             self.statusBar().showMessage(f"Saved {path}")
         except Exception as exc:
-            QMessageBox.critical(self, "Cover Cleaner", str(exc))
+            QMessageBox.critical(self, APP_NAME, str(exc))
 
     def batch_dialog(self):
         names = [self.file_list.item(i).text() for i in range(self.file_list.count())]
         if not names or self.busy:
             return
-        out = QFileDialog.getExistingDirectory(self, "Folder for the restored images",
-                                               self.folder)
+        start = self.settings.save_dir or os.path.join(self.folder, "restored")
+        out = QFileDialog.getExistingDirectory(self, "Folder for the restored images", start)
         if not out:
             return
         if os.path.normcase(os.path.abspath(out)) == os.path.normcase(os.path.abspath(self.folder)):
             out = os.path.join(out, "restored")   # never overwrite the scans
-        folder, bits, mode = self.folder, int(self.bits.currentText()), self._mode()
+        st = _settings.AppSettings.from_dict(self.settings.to_dict())
+        st.pipeline = self._mode()                # what the toolbar shows now
+        st.bits = int(self.bits.currentText())
+        files = [os.path.join(self.folder, n) for n in names]
         self.busy = True
 
         def work(progress):
             log = []
-            for i, name in enumerate(names):
-                progress(f"Restoring {name} ({i + 1}/{len(names)})", i / len(names))
-                try:
-                    src = load_image(os.path.join(folder, name))
-                    pipe = Pipeline(src)
-                    params, report = auto_params(src, None, pipe, mode,
-                                                 read_dpi(os.path.join(folder, name)))
-                    dst = os.path.join(out, os.path.splitext(name)[0] + ".png")
-                    save_image(dst, pipe.run(params), bits)
-                    with open(os.path.splitext(dst)[0] + ".json", "w", encoding="utf8") as fh:
-                        fh.write(params.to_json())
-                    log.append(f"{name}: saved\n  " + "\n  ".join(report))
-                except Exception as exc:
-                    log.append(f"{name}: FAILED - {exc}")
+
+            def emit(text):
+                log.append(text)
+
+            _cli.run_batch(files, st, out, emit=emit,
+                           progress=lambda k, n: progress(f"Restoring {k}/{n}", k / n))
             return log
 
         def done(log):
@@ -914,6 +925,53 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Batch finished: results in {out}")
 
         self._run_job(work, done, "Batch…")
+
+    # ---- menus, options, about -------------------------------------------
+    def _title(self, name: str | None = None) -> str:
+        t = f"{APP_NAME} {__version__}"
+        return f"{t} - {name}" if name else t
+
+    def _build_menus(self):
+        mb = self.menuBar()
+        m = mb.addMenu("&File")
+        for a in (self.act_open, self.act_open_folder):
+            m.addAction(a)
+        m.addSeparator()
+        m.addAction(self.act_save)
+        m.addAction(self.act_batch)
+        m.addSeparator()
+        m.addAction(self.act_load_settings)
+        m.addAction(self.act_save_settings)
+        m.addSeparator()
+        quit_ = QAction("E&xit", self)
+        quit_.triggered.connect(self.close)
+        m.addAction(quit_)
+        m = mb.addMenu("&Settings")
+        opt = QAction("&Options…", self)
+        opt.setShortcut(QKeySequence("Ctrl+,"))
+        opt.triggered.connect(self.open_options)
+        m.addAction(opt)
+        m = mb.addMenu("&Help")
+        about = QAction(f"&About {APP_NAME}", self)
+        about.triggered.connect(lambda: AboutDialog(self).exec())
+        m.addAction(about)
+
+    def open_options(self):
+        dlg = OptionsDialog(self.settings, self)
+        if not dlg.exec():
+            return
+        new = dlg.result_settings()
+        try:
+            _settings.save(new)
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not save the options:\n{exc}")
+        old, self.settings = self.settings, new
+        _ml.set_use_gpu(new.use_gpu)
+        if new.pipeline != old.pipeline:
+            self.mode_combo.setCurrentIndex(1 if new.mode(_ml.available()) == "ml" else 0)
+        if new.bits != old.bits:
+            self.bits.setCurrentIndex(1 if new.bits == 16 else 0)
+        self.statusBar().showMessage("Options saved. Auto uses them from the next run.")
 
 
 def run_gui(image: str | None = None) -> int:

@@ -46,9 +46,21 @@ def float_model_path() -> str:
     return os.path.splitext(model_path())[0] + ".float.onnx"
 
 
+_use_gpu = True
+
+
+def set_use_gpu(flag: bool) -> None:
+    """Allow or forbid the GPU (Options > Use GPU); takes effect for models
+    loaded afterwards."""
+    global _use_gpu, _net, _gpu
+    if bool(flag) != _use_gpu:
+        _use_gpu = bool(flag)
+        _net, _gpu = None, False          # reload on next use with the new choice
+
+
 def gpu_usable() -> bool:
     """Whether LaMa can run on the GPU here (without loading it)."""
-    if os.environ.get("COVERCLEANER_DEVICE", "").lower() == "cpu":
+    if not _use_gpu or os.environ.get("COVERCLEANER_DEVICE", "").lower() == "cpu":
         return False
     try:
         import onnxruntime as ort

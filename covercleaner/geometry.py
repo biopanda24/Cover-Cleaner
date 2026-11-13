@@ -888,7 +888,8 @@ def _foreign_strip(img_blur, corners, dpi, notes, fixed=(False,) * 4, moved=None
     return c
 
 
-def _white_margins(img_blur, corners, dpi, notes, fixed=(False,) * 4, lid=None, restored=None):
+def _white_margins(img_blur, corners, dpi, notes, fixed=(False,) * 4, lid=None, restored=None,
+                   thin_strip=True):
     """Give a side back its white border when the crop stopped at the print.
 
     Many covers have a plain white border around the artwork.  On a white
@@ -976,7 +977,7 @@ def _white_margins(img_blur, corners, dpi, notes, fixed=(False,) * 4, lid=None, 
     # are printed right to the edge, is not a border (the white core of the
     # cut card, a paper rim) - crop to the print.
     trimmed = []
-    if not (margin > 0).any() and flush.sum() >= 2 and white >= 0.92:
+    if thin_strip and not (margin > 0).any() and flush.sum() >= 2 and white >= 0.92:
         for i in np.flatnonzero(narrow > 0):
             if fixed[i] or (narrow > 0).sum() > 1:
                 continue
@@ -1128,8 +1129,15 @@ def _square_up(corners: np.ndarray, conf) -> np.ndarray:
     return out
 
 
-def detect_cover(img: np.ndarray, fit_bow: bool = False, dpi: float | None = None) -> CoverDetection:
-    """Locate the cover in a scan. `img` is float32 BGR 0..1."""
+def detect_cover(img: np.ndarray, fit_bow: bool = False, dpi: float | None = None,
+                 rules=None) -> CoverDetection:
+    """Locate the cover in a scan. `img` is float32 BGR 0..1.
+
+    `rules` (settings.AutoRules or anything with the same attributes) can
+    switch off standard-size placement, white-border restoring and the
+    cropping of strips showing past one edge; all are on by default.
+    """
+    use = lambda name: getattr(rules, name, True) if rules is not None else True
     h, w = img.shape[:2]
     det = CoverDetection(corners=full_corners(img.shape),
                          bow=np.zeros((4, BOW_SAMPLES)))
@@ -1310,11 +1318,15 @@ def detect_cover(img: np.ndarray, fit_bow: bool = False, dpi: float | None = Non
         det.notes.append("Cropped to the edge of the print, past a thin rim or something "
                          "under the jacket: " + ", ".join(moved_under) + ".")
     weak = [(not found[i]) or conf[i] < 0.3 or flat_jump[i] or faint_used[i] for i in range(4)]
-    corners = _snap_to_standard(corners, conf, weak, dpi, det.notes, img_blur, at_border, lid)
+    if use("standard_size"):
+        corners = _snap_to_standard(corners, conf, weak, dpi, det.notes, img_blur, at_border, lid)
     restored, stripped = [], []
-    corners = _white_margins(img_blur, corners, dpi, det.notes, at_border, lid, restored)
+    if use("white_border"):
+        corners = _white_margins(img_blur, corners, dpi, det.notes, at_border, lid, restored,
+                                 thin_strip=use("strip_crop"))
     fixed_now = [at_border[k] or k in restored for k in range(4)]
-    corners = _foreign_strip(img_blur, corners, dpi, det.notes, fixed_now, stripped)
+    if use("strip_crop"):
+        corners = _foreign_strip(img_blur, corners, dpi, det.notes, fixed_now, stripped)
     center = corners.mean(axis=0)
 
     # ---- bow (curved edges) and trim suggestions -------------------------

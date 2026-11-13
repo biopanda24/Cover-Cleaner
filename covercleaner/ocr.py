@@ -32,6 +32,11 @@ def _models_dir() -> str:
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
 
 
+def model_paths() -> list[str]:
+    d = _models_dir()
+    return [os.path.join(d, DET_FILE), os.path.join(d, REC_FILE)]
+
+
 def available() -> bool:
     d = _models_dir()
     return os.path.isfile(os.path.join(d, DET_FILE)) and os.path.isfile(os.path.join(d, REC_FILE))
