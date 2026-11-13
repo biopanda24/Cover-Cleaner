@@ -71,6 +71,11 @@ class OptionsDialog(QDialog):
         self.jpeg_q.setRange(50, 100)
         self.jpeg_q.setValue(self._s.jpeg_quality)
         f.addRow("JPEG quality", self.jpeg_q)
+        out_form = f
+        # only meaningful for JPEG
+        self.format.currentIndexChanged.connect(
+            lambda i: out_form.setRowVisible(self.jpeg_q, i == 2))
+        out_form.setRowVisible(self.jpeg_q, self.format.currentIndex() == 2)
         self.suffix = QLineEdit(self._s.suffix)
         self.suffix.setPlaceholderText("none, e.g. _clean")
         f.addRow("File name suffix", self.suffix)
@@ -150,14 +155,6 @@ class OptionsDialog(QDialog):
         f = _form(tabs, "Models")
         self._model_rows(f)
 
-        # ---- About -------------------------------------------------------
-        page = QWidget()
-        lay = QVBoxLayout(page)
-        lay.addWidget(about_label())
-        lay.addStretch(1)
-        lay.addWidget(_note(f"Options are stored in {settings_path()}"))
-        tabs.addTab(page, "About")
-
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel
                                    | QDialogButtonBox.RestoreDefaults)
         buttons.accepted.connect(self.accept)
@@ -165,6 +162,7 @@ class OptionsDialog(QDialog):
         buttons.button(QDialogButtonBox.RestoreDefaults).clicked.connect(self._defaults)
         lay = QVBoxLayout(self)
         lay.addWidget(tabs)
+        lay.addWidget(_note(f"Options are stored in {settings_path()}"))
         lay.addWidget(buttons)
 
     def _model_rows(self, f: QFormLayout):

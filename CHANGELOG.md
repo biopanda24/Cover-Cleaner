@@ -3,6 +3,12 @@
 Version numbers follow semantic versioning: the minor number goes up for
 new features, the patch number for fixes.
 
+## 0.2.1 - 2026-11-13
+
+- Options: the About tab is gone (Help > About shows the same); the
+  options file location is shown at the bottom of the dialog.
+- Options: JPEG quality is only shown when JPEG is the selected format.
+
 ## 0.2.0 - 2026-11-13
 
 - Options menu (Settings > Options...): default save location, format, bit
