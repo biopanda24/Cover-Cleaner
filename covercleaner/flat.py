@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 DEBUG = None      # set to {} to capture edge-rebuild internals
+POCKET_GRAIN = 0.03
 
 import cv2
 import numpy as np
@@ -321,7 +322,7 @@ def _extend_sections(labels, res, img, tolerance, reach):
     h, w = labels.shape
     inside = labels > 0
     if not inside.any():
-        return labels
+        return labels, np.zeros((h, w), bool)
     med = cv2.GaussianBlur(cv2.medianBlur(np.ascontiguousarray(img, np.float32), 5), (0, 0), 1.0)
     cnt = np.bincount(labels.ravel(), minlength=len(res.colours))
     groups: dict = {}
@@ -347,6 +348,93 @@ def _extend_sections(labels, res, img, tolerance, reach):
         keep[0] = False
         grow = cand & keep[comp]
         out[grow] = leads[k]
+    # Pockets of a flat colour cut off by lettering or shapes (the gaps
+    # between the strokes of a character on a coloured band) are too narrow
+    # to pass the region test and too far to be grown into.  A pocket whose
+    # colour clearly matches a flat colour joins it when flat sections (or
+    # the thin edge between them) surround it on all sides - so a patch of
+    # similar colour in a photo, with picture around it, is left alone.
+    assigned = out > 0
+    ring_in = np.ones((9, 9), np.uint8)
+    ring_out = np.ones((15, 15), np.uint8)
+    lead_of = np.zeros(len(res.colours), np.int32)
+    for k, mem in enumerate(members):
+        lead_of[mem] = k + 1
+    grp_now = lead_of[out]                                   # 0 = unassigned
+    # In a narrow gap the scanner's blur bleeds the neighbouring colour (black
+    # strokes) into the pocket within a few pixels of it, so there the colour
+    # is a mix - mostly this colour.
+    pockets = np.zeros((h, w), bool)
+    fine_lum = cv2.GaussianBlur(img, (0, 0), 1.0) @ np.float32([0.114, 0.587, 0.299])
+    for k, mem in enumerate(members):
+        mixk = (dmin < 1.5 * tolerance) & (nearest == k)
+        for j in range(len(members)):
+            if j == k:
+                continue
+            v = obs[k] - obs[j]
+            vv = float((v * v).sum())
+            if vv < (3 * tolerance) ** 2:
+                continue
+            near_j = cv2.distanceTransform((grp_now != j + 1).astype(np.uint8), cv2.DIST_L2, 3) <= 6
+            al = ((med - obs[j]) @ v) / vv
+            res_ = np.abs(med - (obs[j] + np.clip(al, 0, 1)[..., None] * v)).max(axis=2)
+            mixk |= near_j & (al >= 0.65) & (res_ < 1.2 * tolerance)
+        cand = (~assigned) & mixk
+        if not cand.any():
+            continue
+        n, comp, stats, _ = cv2.connectedComponentsWithStats(cand.astype(np.uint8), 8)
+        if n <= 1:
+            continue
+        # the pocket as a whole is this colour (its middle is not darkened)
+        cnt_c = np.maximum(np.bincount(comp.ravel(), minlength=n), 1)
+        mean_c = np.stack([np.bincount(comp.ravel(), med[..., c].ravel(), minlength=n) / cnt_c
+                           for c in range(3)], axis=1)
+        same = np.abs(mean_c - obs[k]).max(axis=1) < 1.5 * tolerance
+        # (a narrow pocket is darkened by blur all the way across: its mean
+        # is then still mostly this colour, mixed with a neighbour's)
+        for j in range(len(members)):
+            if j == k:
+                continue
+            v = obs[k] - obs[j]
+            vv = float((v * v).sum())
+            if vv < (3 * tolerance) ** 2:
+                continue
+            al = ((mean_c - obs[j]) @ v) / vv
+            res_ = np.abs(mean_c - (obs[j] + np.clip(al, 0, 1)[:, None] * v)).max(axis=1)
+            same |= (al >= 0.75) & (res_ < tolerance)
+        # ... and smooth, like the flat colour it belongs to; a patch of
+        # photo (hair, fabric) between dark areas has texture
+        # texture in the pocket's interior (its edges are darkened by blur)
+        depth = cv2.distanceTransform(cand.astype(np.uint8), cv2.DIST_L2, 3)
+        core = (depth >= 3) & cand
+        cid = comp[core]
+        lum = fine_lum[core]
+        cnt_i = np.maximum(np.bincount(cid, minlength=n), 1)
+        mlum = np.bincount(cid, lum, minlength=n) / cnt_i
+        mad = np.bincount(cid, np.abs(lum - mlum[cid]), minlength=n) / cnt_i
+        same &= mad < POCKET_GRAIN
+        # ... and a real area of colour, not a thin highlight or streak
+        deepest = np.zeros(n, np.float32)
+        np.maximum.at(deepest, comp.ravel(), depth.ravel())
+        same &= (deepest >= 4) & (stats[:, cv2.CC_STAT_AREA] >= 150)
+        # ringed by flat sections, a little way out past the edge band
+        cu = cand.astype(np.uint8)
+        ring = (cv2.dilate(cu, ring_out) > 0) & ~(cv2.dilate(cu, ring_in) > 0)
+        rid = cv2.dilate(comp.astype(np.float32), ring_out).astype(np.int32)
+        tot = np.bincount(rid[ring], minlength=n)
+        flat_ring = np.bincount(rid[ring & assigned], minlength=n)
+        # not touching the image border: enclosure unknown there (and a worn
+        # paper edge is lighter than the colour it runs along)
+        x0s, y0s = stats[:, cv2.CC_STAT_LEFT], stats[:, cv2.CC_STAT_TOP]
+        x1s, y1s = x0s + stats[:, cv2.CC_STAT_WIDTH], y0s + stats[:, cv2.CC_STAT_HEIGHT]
+        inner = (x0s > 0) & (y0s > 0) & (x1s < w) & (y1s < h)
+        take = ((stats[:, cv2.CC_STAT_AREA] >= 20) & same & inner
+                & (flat_ring >= 0.85 * np.maximum(tot, 1)))
+        take[0] = False
+        if take.any():
+            sel = take[comp]
+            out[sel] = leads[k]
+            pockets |= sel
     # enclosed holes (specks, dust, flare) up to ~1 mm across, inside one section
     free = (out == 0).astype(np.uint8)
     n, hl, stats, _ = cv2.connectedComponentsWithStats(free, 8)
@@ -369,7 +457,7 @@ def _extend_sections(labels, res, img, tolerance, reach):
             one = small & (g_hi == g_lo) & (g_hi > 0)
             fill = one[hl]
             out[fill] = np.array([0] + leads)[g_hi[hl[fill]]]
-    return out
+    return out, pockets
 
 
 def flatten(img: np.ndarray, tolerance: float = 0.06, min_area_pct: float = 0.05,
@@ -428,7 +516,7 @@ def flatten(img: np.ndarray, tolerance: float = 0.06, min_area_pct: float = 0.05
             hi, lo = around(labels.astype(np.float32))
     labels, thin = _thin_strokes(labels, res, img, tolerance)
     seeds = labels > 0
-    labels = _extend_sections(labels, res, img, tolerance, reach=12.0)
+    labels, pockets = _extend_sections(labels, res, img, tolerance, reach=12.0)
     inside = labels > 0
     st = float(min(strength, 1.0))
     # Blend by closeness: a pixel near a region's colour (as scanned) becomes
@@ -460,11 +548,13 @@ def flatten(img: np.ndarray, tolerance: float = 0.06, min_area_pct: float = 0.05
     sec = (np.clip((2.0 * tolerance - d_med) / tolerance, 0.0, 1.0)
            * np.clip((6.0 * tolerance - d_fine) / (2.0 * tolerance), 0.0, 1.0))
     close = np.where(inside, sec, close)
+    close[pockets] = 1.0                 # matched as a whole, darkened by blur
     wgt = cv2.GaussianBlur((close * prox).astype(np.float32), (0, 0), 1.0) * (near_lab > 0)
     out = img + (st * wgt)[:, :, None] * (target - img)
     mask = (wgt > 0.5).astype(np.uint8) * 255
     if clean_edges:
-        out, seam = _rebuild_edges(out, img, smooth, labels, res, tolerance, st, wgt, near_lab, thin)
+        out, seam = _rebuild_edges(out, img, smooth, labels, res, tolerance, st, wgt, near_lab,
+                                   thin | pockets)
         mask[seam] = 255
     if protect is not None and protect.any():
         keep = protect > 0
@@ -589,7 +679,10 @@ def _rebuild_edges(out, img, smooth, labels, res, tolerance, st, wmain, near_lab
                                                  np.clip((2.0 * tolerance - off) / (0.8 * tolerance), 0.0, 1.0))])
     # between two sections that are flat all round, every pixel of the edge
     # band is the edge: redraw it as the clean mix, no partial leftovers
-    gate = np.maximum(gate, cover * ((dist_a + dist_b) <= 0.75 * band))
+    between = cover * ((dist_a + dist_b) <= 0.75 * band)
+    gate = np.maximum(gate, between)
+    # ... even when the scan tints it a little off the straight mix
+    fit = np.maximum(fit, between * np.clip((3.0 * tolerance - resid) / tolerance, 0.0, 1.0))
     if DEBUG is not None:
         DEBUG.update(ys=ys, xs=xs, fit=fit, gate=gate, cover=cover, off=off, alpha=alpha,
                      mixed=mixed, steep=steep, dist_a=dist_a, dist_b=dist_b, inside=inside[ys, xs],
