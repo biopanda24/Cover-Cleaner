@@ -3,6 +3,16 @@
 Version numbers follow semantic versioning: the minor number goes up for
 new features, the patch number for fixes.
 
+## 0.5.2 - 2026-11-13
+
+- The new-version window shows what changed: the release notes appear
+  formatted, with working links, above *Update now*, *View on GitHub*,
+  *Skip this version* and *Later*. Choosing *Update now* starts the update
+  without asking a second time.
+- *Help > About > Check for updates* opens the same window.
+- Each GitHub release now uses that version's CHANGELOG section as its
+  notes (they were only a link to the list of commits).
+
 ## 0.5.1 - 2026-11-13
 
 - The release build on GitHub failed: `installer/build.py --out dist` gave

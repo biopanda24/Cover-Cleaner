@@ -6,8 +6,8 @@ import os
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
-                               QLineEdit, QPushButton, QSpinBox, QTabWidget, QVBoxLayout,
-                               QWidget)
+                               QLineEdit, QPushButton, QSpinBox, QTabWidget, QTextBrowser,
+                               QVBoxLayout, QWidget)
 
 from .. import __version__
 from .. import ml as _ml
@@ -269,6 +269,42 @@ def about_label() -> QLabel:
     lab.setTextInteractionFlags(Qt.TextBrowserInteraction)
     lab.setWordWrap(True)
     return lab
+
+
+class UpdateDialog(QDialog):
+    """A new version: its release notes, and what to do about it.
+    After exec(), `choice` is "update", "view", "skip" or "later"."""
+
+    def __init__(self, release, parent=None, allow_skip: bool = True):
+        super().__init__(parent)
+        self.choice = "later"
+        self.setWindowTitle(f"{APP_NAME} {release.version}")
+        self.resize(560, 420)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(f"<b>{APP_NAME} {release.version} is available.</b> "
+                             f"You have version {__version__}."))
+        notes = QTextBrowser()
+        notes.setOpenExternalLinks(True)
+        notes.setMarkdown(release.notes or "No notes were published for this version.")
+        lay.addWidget(notes, 1)
+        lay.addWidget(_note("Update now downloads it, closes Cover Cleaner while it installs "
+                            "and starts it again. Unsaved results are lost."))
+        box = QDialogButtonBox()
+        buttons = [("Update now", QDialogButtonBox.AcceptRole, "update"),
+                   ("View on GitHub", QDialogButtonBox.ActionRole, "view")]
+        if allow_skip:
+            buttons.append(("Skip this version", QDialogButtonBox.RejectRole, "skip"))
+        buttons.append(("Later", QDialogButtonBox.RejectRole, "later"))
+        for text, role, choice in buttons:
+            b = box.addButton(text, role)
+            b.clicked.connect(lambda _=False, c=choice: self._choose(c))
+            if choice == "update":
+                b.setDefault(True)
+        lay.addWidget(box)
+
+    def _choose(self, choice: str):
+        self.choice = choice
+        self.accept() if choice == "update" else self.reject()
 
 
 class AboutDialog(QDialog):

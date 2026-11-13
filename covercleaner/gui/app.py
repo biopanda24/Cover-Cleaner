@@ -27,7 +27,7 @@ from ..auto import auto_params
 from ..imageio import SUPPORTED, load_image, read_dpi, save_image
 from ..params import Params
 from ..pipeline import Pipeline
-from .options import APP_NAME, EXPERIMENTAL, AboutDialog, OptionsDialog
+from .options import APP_NAME, EXPERIMENTAL, AboutDialog, OptionsDialog, UpdateDialog
 from .view import ImageView, mask_pixmap, to_pixmap
 
 
@@ -1146,36 +1146,25 @@ class MainWindow(QMainWindow):
         self.check_for_updates(done)
 
     def show_about(self):
-        AboutDialog(self, check=self.check_for_updates, update=self.update_to).exec()
+        AboutDialog(self, check=self.check_for_updates, update=self._offer_update).exec()
 
     def _offer_update(self, release, startup: bool = False):
-        box = QMessageBox(self)
-        box.setWindowTitle(APP_NAME)
-        box.setIcon(QMessageBox.Information)
-        box.setText(f"<b>{APP_NAME} {release.version} is available</b><br>"
-                    f"You have version {__version__}.")
-        if release.notes:
-            box.setDetailedText(release.notes)
-        b_update = box.addButton("Update now", QMessageBox.AcceptRole)
-        b_view = box.addButton("View on GitHub", QMessageBox.HelpRole)
-        b_skip = box.addButton("Skip this version", QMessageBox.RejectRole) if startup else None
-        box.addButton("Later", QMessageBox.RejectRole)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is b_update:
-            self.update_to(release)
-        elif clicked is b_view:
+        dlg = UpdateDialog(release, self, allow_skip=startup)
+        dlg.exec()
+        if dlg.choice == "update":
+            self.update_to(release, confirm=False)      # the dialog was the confirmation
+        elif dlg.choice == "view":
             from PySide6.QtCore import QUrl
             from PySide6.QtGui import QDesktopServices
             QDesktopServices.openUrl(QUrl(release.url))
-        elif b_skip is not None and clicked is b_skip:
+        elif dlg.choice == "skip":
             self.settings.skip_version = release.version
             try:
                 _settings.save(self.settings)
             except OSError:
                 pass
 
-    def update_to(self, release):
+    def update_to(self, release, confirm: bool = True):
         ok, why = _updater.can_update()
         if not ok:
             QMessageBox.information(
@@ -1186,7 +1175,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, APP_NAME, "Please wait until the current work "
                                     "has finished, then update.")
             return
-        if QMessageBox.question(
+        if confirm and QMessageBox.question(
                 self, APP_NAME,
                 f"Download and install {APP_NAME} {release.version}?\n\n"
                 "Cover Cleaner closes while it installs the update and then starts again. "

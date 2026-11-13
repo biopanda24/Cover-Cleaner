@@ -87,4 +87,4 @@ jobs:
             dist/*.run
             dist/*.zip
             dist/*.sha256
-          generate_release_notes: true
+          body_path: dist/release-notes.md    # this version's CHANGELOG section

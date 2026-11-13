@@ -75,6 +75,19 @@ def python_version() -> str:
     return open(os.path.join(ROOT, ".python-version"), encoding="utf8").read().strip()
 
 
+REPO_URL = "https://github.com/biopanda24/Cover-Cleaner"
+
+
+def release_notes(v: str) -> str:
+    """The CHANGELOG.md section for version `v` (shown in the update dialog
+    and on the GitHub release page)."""
+    text = open(os.path.join(ROOT, "CHANGELOG.md"), encoding="utf8").read().replace("\r\n", "\n")
+    m = re.search(rf"^## {re.escape(v)}\b[^\n]*\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+    if not m or not m.group(1).strip():
+        raise SystemExit(f"CHANGELOG.md has no section for {v}: add one before building")
+    return (m.group(1).strip() + f"\n\n[All changes]({REPO_URL}/blob/main/CHANGELOG.md)\n")
+
+
 def _template(name: str, v: str, **extra) -> str:
     text = open(os.path.join(HERE, name), encoding="utf8").read()
     for k, val in dict(VERSION=v, PYTHON=python_version(), UV=UV_VERSION, **extra).items():
@@ -211,6 +224,8 @@ def main(argv=None) -> int:
     os.makedirs(a.out, exist_ok=True)
     files = app_files()
     print(f"Cover Cleaner {v}: {len(files)} files")
+    with open(os.path.join(a.out, "release-notes.md"), "w", encoding="utf8", newline="\n") as fh:
+        fh.write(release_notes(v))
     made = [build_app_zip(files, v, a.out)]
     targets = {t.strip() for t in a.targets.split(",") if t.strip()}
     if "linux" in targets:

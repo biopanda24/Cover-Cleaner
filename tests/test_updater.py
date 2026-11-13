@@ -216,3 +216,17 @@ def test_lock_covers_requirements():
             base = name.split(">")[0].split("<")[0].split("=")[0].strip().lower().replace("_", "-")
             assert base in pinned, f"{base} is not in requirements.lock - run installer/lock.py"
     assert (root / ".python-version").read_text().strip() in lock
+
+
+def test_release_notes_from_changelog():
+    root = pathlib.Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(root / "installer"))
+    try:
+        import build
+    finally:
+        sys.path.pop(0)
+    from covercleaner import __version__
+    notes = build.release_notes(__version__)
+    assert notes.strip() and "\n## " not in notes and "CHANGELOG.md" in notes
+    with pytest.raises(SystemExit):
+        build.release_notes("999.0.0")
