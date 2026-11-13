@@ -786,6 +786,8 @@ def _snap_to_standard(corners, conf, weak, dpi, notes, img_blur=None, fixed=(Fal
             continue
         dev = nearest * px - length
         tol = 0.12 if (nearest == 120.0 and square[dim]) else 0.04
+        if conf[side] < 0.2:
+            tol = max(tol, 0.06)          # next to no edge seen: the size is the better guess
         booklet_dev = 120.0 * px - length
         if square[dim] and lid is not None and booklet_dev < 0                 and abs(booklet_dev) <= 0.12 * 120.0 * px:
             # Is everything between this side and the square-booklet position
@@ -801,6 +803,238 @@ def _snap_to_standard(corners, conf, weak, dpi, notes, img_blur=None, fixed=(Fal
         if 3 <= abs(dev) <= tol * nearest * px:
             move(side, dev, f"placed from the standard {names[(dim, nearest)]} size "
                             f"({nearest:g} mm); the edge itself is not clearly visible")
+    return c
+
+
+_DEBUG_MARGINS = False
+
+
+def _foreign_strip(img_blur, corners, dpi, notes, fixed=(False,) * 4, moved=None):
+    """Crop a strip of something else showing along one side only.
+
+    A booklet, tray card or obi lying under the jacket and sticking out
+    past one edge shows as a band right at that edge whose colour has
+    nothing to do with the artwork next to it, ending in a sharp step to
+    the artwork.  When exactly one side has such a band (0.4-3 mm wide) and
+    the opposite side has none - a printed frame or border would show on
+    both - the crop moves in to where the artwork starts.
+    """
+    if not dpi or dpi < 100:
+        return corners
+    px = dpi / 25.4
+    c = np.asarray(corners, np.float64).copy()
+    center = c.mean(axis=0)
+    e0 = max(2, int(0.25 * px))
+    strip = np.zeros(4)
+    band_col = np.zeros((4, 3))
+    edge_col = np.zeros((4, 3))
+    for i in range(4):
+        a, b = c[i], c[(i + 1) % 4]
+        t, n, length = _side_frame(a, b, center)
+        _, _, band = _sample_band(img_blur, a, t, n, length, 0, step=6.0, margin=0.1,
+                                  inner=int(10 * px))
+        prof = np.median(band, axis=0)                     # colour by depth
+        edge_col[i] = np.median(prof[e0:int(1 * px)], axis=0)
+        art = np.median(prof[int(3.5 * px):int(9 * px)], axis=0)
+        d = np.abs(prof - art).max(axis=1)
+        d = cv2.GaussianBlur(d.astype(np.float32)[None], (0, 0), 1.0)[0]
+        best = 0
+        for x in range(int(0.4 * px), int(3 * px)):
+            inside = d[e0:x]
+            after = d[x + 2:x + int(0.5 * px)]
+            if (float(inside.mean()) >= 0.3 and float(inside.min()) >= 0.15
+                    and float(np.median(after)) <= min(0.12, 0.35 * float(inside.mean()))):
+                # past the step: where the colour has settled at the artwork's
+                low = np.flatnonzero(d[x:x + int(0.5 * px)] < max(0.06, 0.25 * float(inside.mean())))
+                best = x + (int(low[0]) if low.size else 0) + 1
+                break
+        if not best:
+            continue
+        col = np.median(band[:, e0:best].reshape(-1, 3), axis=0)
+        # a physical object along the edge: the band differs from the artwork
+        # along (nearly) the whole side; artwork features come and go
+        rows = np.abs(band - art).max(axis=2)
+        rows = cv2.GaussianBlur(rows.astype(np.float32), (0, 0), 1.0)
+        before = float((rows[:, e0:max(e0 + 1, best - 4)].mean(axis=1) >= 0.15).mean())
+        if _DEBUG_MARGINS:
+            print("  strip cand side", i, "w", best, "before", round(before, 2),
+                  "col", np.round(col * 255).tolist())
+        if before < 0.9:
+            continue
+        # wider than 1 mm: only a paper-like band (a booklet or card), not ink
+        lum = float(luminance(col[None, None])[0, 0])
+        if best > 1.0 * px and (lum < 0.75 or float(col.max() - col.min()) > 0.10):
+            continue
+        strip[i] = best
+        band_col[i] = col
+    if _DEBUG_MARGINS:
+        print("strips", strip.tolist())
+    sides = np.flatnonzero(strip > 0)
+    if len(sides) != 1:
+        return corners
+    i = int(sides[0])
+    if fixed[i] or strip[(i + 2) % 4] > 0:
+        return corners
+    if np.abs(edge_col[(i + 2) % 4] - band_col[i]).max() < 0.10:
+        return corners                    # same colour at the opposite edge: a frame
+    t, n, length = _side_frame(c[i], c[(i + 1) % 4], center)
+    dlt = float(strip[i])
+    c[i] = c[i] - n * dlt
+    c[(i + 1) % 4] = c[(i + 1) % 4] - n * dlt
+    notes.append(f"Cropped off something showing past the {SIDE_NAMES[i]} edge "
+                 f"(a band unlike the artwork, on that side only): {dlt:.0f} px.")
+    if moved is not None:
+        moved.append(i)
+    return c
+
+
+def _white_margins(img_blur, corners, dpi, notes, fixed=(False,) * 4, lid=None, restored=None):
+    """Give a side back its white border when the crop stopped at the print.
+
+    Many covers have a plain white border around the artwork.  On a white
+    scanner lid the paper edge of such a border may be invisible, and the
+    crop then stops where the print starts.  When the opposite side (or the
+    others) show a clear white border, and outside this side there is
+    nothing but plain white, the side is moved out by that border's width -
+    onto a faint paper edge if one shows near there.  A print that really
+    runs to the paper edge looks the same, so the move is only made when it
+    brings the cover to within 1.5 % of a standard jacket size.
+    """
+    if not dpi or dpi < 100:
+        return corners
+    px = dpi / 25.4
+    c = np.asarray(corners, np.float64).copy()
+    center = c.mean(axis=0)
+    depth = int(14 * px)                                  # look 14 mm inside
+    frames, bands = [], []
+    for i in range(4):
+        a, b = c[i], c[(i + 1) % 4]
+        t, n, length = _side_frame(a, b, center)
+        _, o, band = _sample_band(img_blur, a, t, n, length, 0, step=6.0, margin=0.1,
+                                  inner=depth)
+        frames.append((t, n, length))
+        bands.append(band)
+    pix = np.concatenate([bd.reshape(-1, 3) for bd in bands])
+    lum_all = luminance(pix[None])[0]
+    paper = np.median(pix[lum_all >= np.percentile(lum_all, 98)], axis=0)   # border colour
+    white = float(luminance(paper[None, None])[0, 0])
+    if white < 0.75:
+        return corners                                    # no white paper here
+    lid_lum = white if lid is None else float(luminance(np.asarray(lid, np.float32)[None, None])[0, 0])
+
+    def ink(band):
+        # anything not paper white: print, even pale cream or pastel
+        return np.abs(band - paper).max(axis=2) > 0.05
+
+    def blank(band):
+        # outside the cut: paper white, then lid (may be a little grey)
+        lum = luminance(band)
+        chroma = band.max(axis=2) - band.min(axis=2)
+        return ~((chroma > 0.06) | (lum < min(white, lid_lum) - 0.08))
+
+    margin = np.full(4, -1.0)                             # px; -1 = unclear
+    narrow = np.full(4, -1.0)                             # a thin white strip only
+    flush = np.zeros(4, bool)
+    e0 = max(2, int(0.25 * px))                           # shaded paper edge itself
+    for i in range(4):
+        prof = np.median(bands[i], axis=0)                # colour by depth, (depth+1, 3)
+        art = np.median(prof[int(9 * px):], axis=0)       # artwork, well inside
+        v = art - paper
+        vv = float((v * v).sum())
+        if np.abs(v).max() < 0.025:
+            continue                                      # artwork too close to white
+        f = ((prof - paper) @ v) / vv                     # 0 = paper white, 1 = artwork
+        f = cv2.GaussianBlur(f.astype(np.float32)[None], (0, 0), 2.0)[0]
+        # a shadow or rim at the very edge, darker than the artwork, is skipped
+        start = e0
+        rim = np.flatnonzero(f[: int(1.5 * px)] > 1.5)
+        if rim.size:
+            start = max(e0, int(rim[-1]) + 3)
+        plateau = np.flatnonzero(f[start:int(2 * px)] < 0.15)
+        if float(f[start:start + int(0.55 * px)].mean()) > 0.3 and not plateau.size:
+            flush[i] = True
+            continue
+        cross = np.flatnonzero(f[start:] > 0.5)
+        if not cross.size:
+            continue
+        mw = float(start + cross[0])
+        if float(f[start:max(start + 1, int(mw) - 2)].mean()) < 0.25:
+            if mw >= 1.5 * px:
+                margin[i] = mw
+            elif mw - start >= 0.4 * px and np.abs(v).max() >= 0.12:
+                # bare paper is smooth; a light halftone background is not
+                zone = luminance(bands[i][:, start:max(start + 1, int(mw) - 3)])
+                grain = float(np.median(np.abs(zone - np.median(zone, axis=0)).mean(axis=1)))
+                if _DEBUG_MARGINS:
+                    print("  narrow side", i, "w", mw, "grain", round(grain, 4))
+                if grain < 0.04:
+                    narrow[i] = mw            # clearly white against strong colour
+    if _DEBUG_MARGINS:
+        print("white", round(white, 3), "flush", flush.tolist(), "margin", np.round(margin).tolist(),
+              "narrow", np.round(narrow).tolist())
+    # The reverse: a thin white strip along one side only, while the others
+    # are printed right to the edge, is not a border (the white core of the
+    # cut card, a paper rim) - crop to the print.
+    trimmed = []
+    if not (margin > 0).any() and flush.sum() >= 2 and white >= 0.92:
+        for i in np.flatnonzero(narrow > 0):
+            if fixed[i] or (narrow > 0).sum() > 1:
+                continue
+            t, n, length = frames[i]
+            d = narrow[i]
+            c[i] = c[i] - n * d
+            c[(i + 1) % 4] = c[(i + 1) % 4] - n * d
+            trimmed.append(f"{SIDE_NAMES[i]} {d:.0f} px")
+    if trimmed:
+        notes.append("Thin white strip along one side only (the others are printed to the "
+                     "edge) cropped off: " + ", ".join(trimmed) + ".")
+        return c
+    if not flush.any() or not (margin > 0).any():
+        return corners
+    sizes = {0: sorted({f[1] for f in STANDARD_FORMATS_MM.values()}),   # top/bottom: height
+             1: sorted({f[0] for f in STANDARD_FORMATS_MM.values()})}   # left/right: width
+    moved = []
+    for i in np.flatnonzero(flush):
+        if fixed[i]:
+            continue
+        j = (i + 2) % 4
+        m = margin[j] if margin[j] > 0 else float(np.median(margin[margin > 0]))
+        t, n, length = frames[i]
+        a = c[i]
+        # outside the cut: nothing but plain white (paper border, then lid)
+        reach = int(m * 1.4) + 4
+        s_, o_, out = _sample_band(img_blur, a, t, n, length, reach, step=4.0, margin=0.1,
+                                   inner=0)
+        clear = o_ >= e0 + 2                              # past the print's own blur
+        busy = 1.0 - float(blank(out[:, clear]).mean())
+        if _DEBUG_MARGINS:
+            print(" side", i, "m", round(m), "outside not blank", round(busy, 4))
+        if busy > 0.03:
+            continue
+        dims = output_size(c)                                # (w, h)
+        cur = dims[1] if i in (0, 2) else dims[0]
+        std = sizes[0] if i in (0, 2) else sizes[1]
+        # where to put it: a faint paper edge near the expected place, else
+        # the same border width (booklets are not cut to an exact size)
+        delta = m
+        fe = _faint_edge(out, o_, s_)
+        if fe is not None and 0.6 * m <= float(np.polyval(fe[0], length / 2)) <= 1.4 * m:
+            delta = float(np.polyval(fe[0], length / 2))
+        # the cover must come out at a standard size
+        new_mm = (cur + delta) / px
+        best = min(std, key=lambda mm: abs(mm - new_mm))
+        if _DEBUG_MARGINS:
+            print(" side", i, "delta", round(delta), "cur mm", round(cur / px, 1), "new mm", round(new_mm, 1))
+        if abs(new_mm - best) > 0.015 * best or abs(new_mm - best) >= abs(cur / px - best):
+            continue
+        c[i] = c[i] + n * delta
+        c[(i + 1) % 4] = c[(i + 1) % 4] + n * delta
+        moved.append(f"{SIDE_NAMES[i]} {delta:.0f} px")
+        if restored is not None:
+            restored.append(int(i))
+    if moved:
+        notes.append("White border restored where the crop had stopped at the print "
+                     "(paper edge not visible on the white lid): " + ", ".join(moved) + ".")
     return c
 
 
@@ -828,6 +1062,8 @@ def _under_element(img_blur, a, t, n, length, lid_colour):
         return 0.0
     e = _pick_edges(band[:, keep], o[keep])
     fit = _fit_side(s, e)
+    if _DEBUG_MARGINS:
+        print("  under fit", None if fit is None else (np.round(fit[0], 3).tolist(), round(fit[1], 2)))
     if fit is None or fit[1] < 0.6:
         return 0.0
     inner = np.polyval(fit[0], s)                         # offsets, negative
@@ -839,6 +1075,9 @@ def _under_element(img_blur, a, t, n, length, lid_colour):
     if region.sum() < 50:
         return 0.0
     tex = np.abs(band - cv2.GaussianBlur(band, (1, 5), 1.0)).max(axis=2)
+    if _DEBUG_MARGINS:
+        print("  under: w", round(w, 1), "conf", round(fit[1], 2), "tex", round(float(tex[region].mean()), 4),
+              "spread", round(float(np.percentile(width, 90) - np.percentile(width, 10)), 1))
     if float(tex[region].mean()) > 0.0075:                 # printed: part of the cover
         return 0.0
     vals = band[region]
@@ -1072,6 +1311,10 @@ def detect_cover(img: np.ndarray, fit_bow: bool = False, dpi: float | None = Non
                          "under the jacket: " + ", ".join(moved_under) + ".")
     weak = [(not found[i]) or conf[i] < 0.3 or flat_jump[i] or faint_used[i] for i in range(4)]
     corners = _snap_to_standard(corners, conf, weak, dpi, det.notes, img_blur, at_border, lid)
+    restored, stripped = [], []
+    corners = _white_margins(img_blur, corners, dpi, det.notes, at_border, lid, restored)
+    fixed_now = [at_border[k] or k in restored for k in range(4)]
+    corners = _foreign_strip(img_blur, corners, dpi, det.notes, fixed_now, stripped)
     center = corners.mean(axis=0)
 
     # ---- bow (curved edges) and trim suggestions -------------------------
@@ -1116,7 +1359,10 @@ def detect_cover(img: np.ndarray, fit_bow: bool = False, dpi: float | None = Non
         if at_border[i]:
             trims.append(0)               # the scan's own edge: nothing to trim
             continue
-        if found[i] and max_wear > 2:
+        if i in restored:
+            trims.append(2)               # placed from the border width, not an edge
+            continue
+        if found[i] and max_wear > 2 and i not in restored:   # restored: no paper edge there
             a, b = corners[i], corners[(i + 1) % 4]
             t, n, length = _side_frame(a, b, center)
             width, kind = edge_wear(img_blur, a, t, n, length, max_wear)

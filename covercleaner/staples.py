@@ -74,90 +74,102 @@ def _runs(mask: np.ndarray, join: int) -> list:
     return runs
 
 
-def detect(img: np.ndarray, dpi: float | None = None) -> StapleResult:
+def detect(img: np.ndarray, dpi: float | None = None, slack=(0, 0, 0, 0)) -> StapleResult:
     """Find staples along the edges of a rectified cover (float BGR).
 
     Only the side with the strongest evidence is kept: a booklet has one
     stapled spine.  Staples come in pairs placed symmetrically about the
     middle of the spine, so when only one is seen (the other lost in a
     picture or already trimmed off) its partner is assumed at the mirrored
-    place.
+    place.  `slack` (px per side: top, right, bottom, left) lets the paper
+    edge lie that far inside the image edge - for a side whose edge could
+    not be seen and was placed from the jacket size.
     """
     h, w = img.shape[:2]
     px = (dpi or 600.0) / 25.4
+    ref1 = int(2.2 * px)
+    best = StapleResult()
+    best_score = 0.0
+    step = max(2, int(0.2 * px))
+    for side in range(4):
+        full = np.ascontiguousarray(_side_view(img, side, ref1 + int(slack[side])))
+        for shift in range(0, int(slack[side]) + 1, step):
+            r = _detect_side(full[shift:shift + ref1], side, px, h, w, shift)
+            if r is not None and r[0] > best_score:
+                best_score, best = r[0], StapleResult(r[1], side)
+    return best
+
+
+def _detect_side(view, side, px, h, w, shift):
+    """(score, staples) for one side, with the paper edge `shift` px into
+    the image, or None."""
     line = max(4, int(0.5 * px))            # staple zone at the edge
     gap0, gap1 = int(0.6 * px), int(1.3 * px)
     ref0, ref1 = int(1.3 * px), int(2.2 * px)
     lmin, lmax = LEN_MM[0] * px, LEN_MM[1] * px
     k = int(0.6 * px) | 1                   # smoothing along the edge
     o = int(px)
-    best = StapleResult()
-    best_score = 0.0
-    for side in range(4):
-        view = np.ascontiguousarray(_side_view(img, side, ref1))
-        vw = view.shape[1]
-        if vw < 4 * lmax:
-            continue
+    vw = view.shape[1]
+    if vw < 4 * lmax or view.shape[0] < ref1:
+        return None
 
-        def prof(a, b):
-            return cv2.blur(view[a:b].mean(axis=0)[None].astype(np.float32), (k, 1))[0]
+    def prof(a, b):
+        return cv2.blur(view[a:b].mean(axis=0)[None].astype(np.float32), (k, 1))[0]
 
-        paper = prof(ref0, ref1)                                     # (vw, 3)
-        behind = prof(gap0, gap1)
-        darkest = cv2.blur(np.sort(view[:line], axis=0)[1][None].astype(np.float32), (k, 1))[0]
-        dark = (paper - darkest).mean(axis=1)                        # >0: zone darker
-        neutral = (darkest.max(axis=1) - darkest.min(axis=1)) < 0.10
-        clean_behind = np.abs(behind - paper).max(axis=1) < 0.05
-        hit = (dark > 0.05) & neutral & clean_behind
-        runs = []
-        for x0, x1 in _runs(hit, o):
-            if not lmin <= x1 - x0 <= lmax:
-                continue
-            frac = (x0 + x1) / 2 / vw
-            inside = float(np.median(dark[x0:x1]))
-            outside = max(float(np.median(dark[max(0, x0 - 5 * o):x0 - o])) if x0 - o > 0 else 0.0,
-                          float(np.median(dark[x1 + o:x1 + 5 * o])) if x1 + o < vw else 0.0)
-            bright = float(np.median(paper[x0:x1].mean(axis=1)))
-            ok = (outside <= 0.45 * inside
-                  and bright - inside >= 0.25          # silver, not black print
-                  and ((bright >= 0.75 and inside >= 0.1) or (inside >= 0.2 and inside >= 0.33 * bright))
-                  and (0.1 <= frac <= 0.4 or 0.6 <= frac <= 0.9))
-            if DEBUG:
-                print("  side", side, "run", x0, x1, "len %.1fmm in %.3f out %.3f paper %.2f frac %.2f ok %s"
-                      % ((x1 - x0) / px, inside, outside, bright, frac, ok))
-            if ok:
-                runs.append((x0, x1, inside))
-        if not runs or len(runs) > 2:
+    paper = prof(ref0, ref1)                                     # (vw, 3)
+    behind = prof(gap0, gap1)
+    darkest = cv2.blur(np.sort(view[:line], axis=0)[1][None].astype(np.float32), (k, 1))[0]
+    dark = (paper - darkest).mean(axis=1)                        # >0: zone darker
+    neutral = (darkest.max(axis=1) - darkest.min(axis=1)) < 0.10
+    clean_behind = np.abs(behind - paper).max(axis=1) < 0.05
+    hit = (dark > 0.05) & neutral & clean_behind
+    runs = []
+    for x0, x1 in _runs(hit, o):
+        if not lmin <= x1 - x0 <= lmax:
             continue
-        score = sum((x1 - x0) * v for x0, x1, v in runs)
-        if score <= best_score:
-            continue
-        spans = [(x0, x1) for x0, x1, _ in runs]
-        if len(spans) == 1:                  # the partner, near the mirrored place
-            x0, x1 = spans[0]
-            m0, m1 = vw - x1, vw - x0
-            a, b = max(0, m0 - 6 * o), min(vw, m1 + 6 * o)
-            near = [(a + s, a + e) for s, e in _runs((dark[a:b] > 0.03) & neutral[a:b], o)]
-            near = [r for r in near if r[1] - r[0] >= 5 * o]
-            if near:
-                spans.append(max(near, key=lambda r: r[1] - r[0]))
-            else:
-                spans.append((max(0, m0 - 2 * o), min(vw, m1 + 2 * o)))
-        found = []
-        pad = int(0.4 * px)
-        for x0, x1 in spans:
-            bx0, bx1 = max(0, x0 - pad), min(vw - 1, x1 + pad)
-            seg = view[:gap1, bx0:bx1]
-            rows = (paper[bx0:bx1].mean(axis=0) - seg.mean(axis=1)).mean(axis=1)
-            hits = np.flatnonzero(rows[:line + 3] > 0.03)
-            dep = int(hits.max() if hits.size else line) + 3
-            around = np.concatenate([view[ref0:ref1, bx0:bx1].reshape(-1, 3),
-                                     view[:dep, max(0, bx0 - pad):bx0].reshape(-1, 3),
-                                     view[:dep, bx1:min(vw, bx1 + pad)].reshape(-1, 3),
-                                     view[dep:gap1, bx0:bx1].reshape(-1, 3)])
-            spread = np.abs(around - np.median(around, axis=0)).max(axis=1)
-            solid = float(np.percentile(spread, 90)) < 0.06
-            box = _to_image_box(side, bx0, 0, bx1, dep, h, w)
-            found.append(Staple(side, tuple(int(v) for v in box), float(dep), solid))
-        best, best_score = StapleResult(found, side), score
-    return best
+        frac = (x0 + x1) / 2 / vw
+        inside = float(np.median(dark[x0:x1]))
+        outside = max(float(np.median(dark[max(0, x0 - 5 * o):x0 - o])) if x0 - o > 0 else 0.0,
+                      float(np.median(dark[x1 + o:x1 + 5 * o])) if x1 + o < vw else 0.0)
+        bright = float(np.median(paper[x0:x1].mean(axis=1)))
+        ok = (outside <= 0.45 * inside
+              and bright - inside >= 0.25          # silver, not black print
+              and ((bright >= 0.75 and inside >= 0.1) or (inside >= 0.2 and inside >= 0.33 * bright))
+              and (0.1 <= frac <= 0.4 or 0.6 <= frac <= 0.9))
+        if DEBUG:
+            print("  side", side, "shift", shift, "run", x0, x1,
+                  "len %.1fmm in %.3f out %.3f paper %.2f frac %.2f ok %s"
+                  % ((x1 - x0) / px, inside, outside, bright, frac, ok))
+        if ok:
+            runs.append((x0, x1, inside))
+    if not runs or len(runs) > 2:
+        return None
+    score = sum((x1 - x0) * v for x0, x1, v in runs)
+    spans = [(x0, x1) for x0, x1, _ in runs]
+    if len(spans) == 1:                  # the partner, near the mirrored place
+        x0, x1 = spans[0]
+        m0, m1 = vw - x1, vw - x0
+        a, b = max(0, m0 - 6 * o), min(vw, m1 + 6 * o)
+        near = [(a + s, a + e) for s, e in _runs((dark[a:b] > 0.03) & neutral[a:b], o)]
+        near = [r for r in near if r[1] - r[0] >= 5 * o]
+        if near:
+            spans.append(max(near, key=lambda r: r[1] - r[0]))
+        else:
+            spans.append((max(0, m0 - 2 * o), min(vw, m1 + 2 * o)))
+    found = []
+    pad = int(0.4 * px)
+    for x0, x1 in spans:
+        bx0, bx1 = max(0, x0 - pad), min(vw - 1, x1 + pad)
+        seg = view[:gap1, bx0:bx1]
+        rows = (paper[bx0:bx1].mean(axis=0) - seg.mean(axis=1)).mean(axis=1)
+        hits = np.flatnonzero(rows[:line + 3] > 0.03)
+        dep = int(hits.max() if hits.size else line) + 3
+        around = np.concatenate([view[ref0:ref1, bx0:bx1].reshape(-1, 3),
+                                 view[:dep, max(0, bx0 - pad):bx0].reshape(-1, 3),
+                                 view[:dep, bx1:min(vw, bx1 + pad)].reshape(-1, 3),
+                                 view[dep:gap1, bx0:bx1].reshape(-1, 3)])
+        spread = np.abs(around - np.median(around, axis=0)).max(axis=1)
+        solid = float(np.percentile(spread, 90)) < 0.06
+        box = _to_image_box(side, bx0, 0, bx1, dep + shift, h, w)
+        found.append(Staple(side, tuple(int(v) for v in box), float(dep + shift), solid))
+    return score, found

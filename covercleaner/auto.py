@@ -98,7 +98,11 @@ def auto_params(source: np.ndarray, progress: Progress = None,
     elif det.has_background and g.rotate90 == 0:
         # Staples at a booklet's spine: fill them in on solid colour, else
         # trim that side just past them.
-        st = staples.detect(img, dpi)
+        # where an edge was not seen (placed from the jacket size), the paper
+        # edge - and the staples on it - may lie a little inside the crop
+        px = (dpi or 600.0) / 25.4
+        slack = [int(1.5 * px) if c < 0.3 else 0 for c in det.side_confidence]
+        st = staples.detect(img, dpi, slack)
         if st.staples:
             side = geometry.SIDE_NAMES[st.side]
             if all(s.solid for s in st.staples):

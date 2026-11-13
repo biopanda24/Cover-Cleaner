@@ -126,6 +126,22 @@ where a mistake would damage the picture:
   tray or another item under the jacket) is cropped off up to the straight
   edge of the print: white rims up to 15 px, dark ones up to 20 px, neutral
   or not-parallel ones up to 45 px, and items under the jacket up to 85 px.
+* A white border that the crop cut off (white paper on a white lid, the
+  paper edge invisible) is given back: when the other sides show a clear
+  border and the scan outside this side is plain white, the side moves out
+  by the same border width (onto a faint paper edge if one shows), as long
+  as the cover then comes out within 1.5% of a standard size. The reverse
+  also holds: a thin plain-white strip along one side only, while the other
+  sides are printed to the edge, is cropped off.
+* Something lying under the jacket and showing past one edge (a booklet,
+  tray card, shadow line) is cropped off when that edge alone has a band
+  unlike the artwork along its whole length, ending in a sharp step; bands
+  over 1 mm must look like paper, and the same colour at the opposite edge
+  marks a printed frame, which is kept.
+* An edge that cannot be seen at all is placed from the standard size up
+  to 6% away (normally 4%).
+* Staples on a side whose edge was placed from the size, not seen, are
+  also looked for up to 1.5 mm inside the crop.
 * Staples at a booklet's spine (thin silver lines 9-16 mm long right at the
   edge, in a symmetric pair) are filled in when they sit on solid colour;
   over a picture, that edge is trimmed just past them instead.
