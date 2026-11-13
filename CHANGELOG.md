@@ -3,6 +3,15 @@
 Version numbers follow semantic versioning: the minor number goes up for
 new features, the patch number for fixes.
 
+## 0.3.0 - 2026-11-13
+
+- Drag scans and/or folders onto the editor window to open them: a
+  folder lists its scans, a single scan opens with the rest of its folder,
+  several files and folders are listed together.
+- `python -m covercleaner gui` (and `CoverCleaner.bat`) accept several
+  scans and folders, e.g. when files are dropped onto the .bat.
+- Options: bit depth is greyed out while JPEG is the selected format.
+
 ## 0.2.1 - 2026-11-13
 
 - Options: the About tab is gone (Help > About shows the same); the

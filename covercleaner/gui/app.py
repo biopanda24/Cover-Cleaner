@@ -11,7 +11,8 @@ from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDockWidget,
                                QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox,
-                               QHBoxLayout, QLabel, QListWidget, QMainWindow, QMessageBox,
+                               QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
+                               QMessageBox,
                                QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
                                QSlider, QSpinBox, QToolButton, QVBoxLayout, QWidget)
 
@@ -181,6 +182,9 @@ class MainWindow(QMainWindow):
         self.view.strokeFinished.connect(self._stroke_finished)
         self.view.picked.connect(self._picked)
 
+        self.setAcceptDrops(True)                 # drop scans or folders anywhere
+        self.view.setAcceptDrops(False)
+        self.view.viewport().setAcceptDrops(False)
         self._build_toolbar()
         self._build_menus()
         self._build_files_dock()
@@ -257,7 +261,7 @@ class MainWindow(QMainWindow):
     def _build_files_dock(self):
         dock = QDockWidget("Scans", self)
         self.file_list = QListWidget()
-        self.file_list.currentTextChanged.connect(self._file_selected)
+        self.file_list.currentItemChanged.connect(self._file_selected)
         dock.setWidget(self.file_list)
         dock.setFeatures(QDockWidget.DockWidgetMovable)
         self.addDockWidget(Qt.LeftDockWidgetArea, dock)
@@ -268,6 +272,7 @@ class MainWindow(QMainWindow):
         dock = QDockWidget("Auto analysis report", self)
         self.report = QPlainTextEdit()
         self.report.setReadOnly(True)
+        self.report.setAcceptDrops(False)        # dropped scans go to the window
         self.report.setMaximumHeight(170)
         dock.setWidget(self.report)
         dock.setFeatures(QDockWidget.DockWidgetMovable)
@@ -506,19 +511,89 @@ class MainWindow(QMainWindow):
             self.set_folder(folder)
 
     def set_folder(self, folder: str, select: str | None = None):
-        self.folder = folder
         names = sorted(n for n in os.listdir(folder) if n.lower().endswith(SUPPORTED))
+        self.set_files([os.path.join(folder, n) for n in names],
+                       os.path.join(folder, select) if select else None, folder)
+
+    def set_files(self, paths: list[str], select: str | None = None,
+                  folder: str | None = None):
+        """Show `paths` in the scan list and open `select` (or the first)."""
+        paths = [os.path.abspath(p) for p in paths]
+        dirs = {os.path.dirname(p) for p in paths}
+        self.folder = folder or (dirs.pop() if len(dirs) == 1 else
+                                 (os.path.commonpath(paths) if paths else self.folder))
         self.file_list.blockSignals(True)
         self.file_list.clear()
-        self.file_list.addItems(names)
+        for p in paths:
+            label = os.path.basename(p) if len(dirs) <= 1 else os.path.relpath(p, self.folder)
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, p)
+            item.setToolTip(p)
+            self.file_list.addItem(item)
         self.file_list.blockSignals(False)
-        if names:
-            idx = names.index(select) if select in names else 0
+        if paths:
+            sel = os.path.abspath(select) if select else None
+            idx = paths.index(sel) if sel in paths else 0
             self.file_list.setCurrentRow(idx)
 
-    def _file_selected(self, name: str):
-        if name:
-            self.load(os.path.join(self.folder, name))
+    def _file_selected(self, item, _previous=None):
+        if item is not None:
+            self.load(item.data(Qt.UserRole))
+
+    def _list_paths(self) -> list[str]:
+        return [self.file_list.item(i).data(Qt.UserRole) for i in range(self.file_list.count())]
+
+    # ---- drag and drop -----------------------------------------------------
+    @staticmethod
+    def _dropped_paths(event) -> list[str]:
+        md = event.mimeData()
+        if not md.hasUrls():
+            return []
+        return [u.toLocalFile() for u in md.urls() if u.isLocalFile() and u.toLocalFile()]
+
+    def dragEnterEvent(self, event):
+        if any(os.path.isdir(p) or p.lower().endswith(SUPPORTED)
+               for p in self._dropped_paths(event)):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        paths = self._dropped_paths(event)
+        if not paths:
+            return
+        event.acceptProposedAction()
+        self.open_paths(paths)
+
+    def open_paths(self, paths: list[str]):
+        """Open what was dropped (or given on the command line): one folder
+        shows its scans; one file opens it with the rest of its folder; several
+        files and/or folders are listed together."""
+        paths = [os.path.abspath(p) for p in paths if os.path.exists(p)]
+        if not paths:
+            return
+        if len(paths) == 1 and os.path.isdir(paths[0]):
+            self.set_folder(paths[0])
+            return
+        if len(paths) == 1 and paths[0].lower().endswith(SUPPORTED):
+            self.set_folder(os.path.dirname(paths[0]), os.path.basename(paths[0]))
+            return
+        files: list[str] = []
+        for p in paths:
+            if os.path.isdir(p):
+                files += sorted(os.path.join(p, n) for n in os.listdir(p)
+                                if n.lower().endswith(SUPPORTED))
+            elif p.lower().endswith(SUPPORTED):
+                files.append(p)
+        seen = set()
+        files = [f for f in files if not (f in seen or seen.add(f))]
+        if files:
+            self.set_files(files)
+        else:
+            self.statusBar().showMessage("No scans (images) among the dropped items.")
 
     def load(self, path: str, auto: bool = True):
         try:
@@ -893,19 +968,19 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, APP_NAME, str(exc))
 
     def batch_dialog(self):
-        names = [self.file_list.item(i).text() for i in range(self.file_list.count())]
-        if not names or self.busy:
+        files = self._list_paths()
+        if not files or self.busy:
             return
         start = self.settings.save_dir or os.path.join(self.folder, "restored")
         out = QFileDialog.getExistingDirectory(self, "Folder for the restored images", start)
         if not out:
             return
-        if os.path.normcase(os.path.abspath(out)) == os.path.normcase(os.path.abspath(self.folder)):
+        src_dirs = {os.path.normcase(os.path.dirname(f)) for f in files}
+        if os.path.normcase(os.path.abspath(out)) in src_dirs:
             out = os.path.join(out, "restored")   # never overwrite the scans
         st = _settings.AppSettings.from_dict(self.settings.to_dict())
         st.pipeline = self._mode()                # what the toolbar shows now
         st.bits = int(self.bits.currentText())
-        files = [os.path.join(self.folder, n) for n in names]
         self.busy = True
 
         def work(progress):
@@ -974,13 +1049,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Options saved. Auto uses them from the next run.")
 
 
-def run_gui(image: str | None = None) -> int:
+def run_gui(paths=None) -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     win = MainWindow()
     win.show()
-    if image:
-        if os.path.isdir(image):
-            win.set_folder(image)
-        else:
-            win.set_folder(os.path.dirname(os.path.abspath(image)), os.path.basename(image))
+    if isinstance(paths, str):
+        paths = [paths]
+    if paths:
+        win.open_paths(list(paths))
     return app.exec()

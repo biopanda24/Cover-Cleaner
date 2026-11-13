@@ -72,10 +72,16 @@ class OptionsDialog(QDialog):
         self.jpeg_q.setValue(self._s.jpeg_quality)
         f.addRow("JPEG quality", self.jpeg_q)
         out_form = f
-        # only meaningful for JPEG
-        self.format.currentIndexChanged.connect(
-            lambda i: out_form.setRowVisible(self.jpeg_q, i == 2))
-        out_form.setRowVisible(self.jpeg_q, self.format.currentIndex() == 2)
+        # JPEG quality only matters for JPEG; bit depth only for PNG and TIFF
+        def format_changed(i):
+            jpeg = i == 2
+            out_form.setRowVisible(self.jpeg_q, jpeg)
+            self.bits.setEnabled(not jpeg)
+            self.bits.setToolTip("JPEG is always 8-bit." if jpeg else
+                                 "16-bit is kept for PNG and TIFF.")
+
+        self.format.currentIndexChanged.connect(format_changed)
+        format_changed(self.format.currentIndex())
         self.suffix = QLineEdit(self._s.suffix)
         self.suffix.setPlaceholderText("none, e.g. _clean")
         f.addRow("File name suffix", self.suffix)

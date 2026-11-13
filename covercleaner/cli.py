@@ -177,12 +177,12 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--bits", type=int, default=8, choices=[8, 16])
 
     g = sub.add_parser("gui", help="open the interactive editor (default)")
-    g.add_argument("image", nargs="?")
+    g.add_argument("paths", nargs="*", help="scans and/or folders to open")
 
     args = ap.parse_args(argv)
     if args.cmd in (None, "gui"):
         from .gui.app import run_gui
-        return run_gui(getattr(args, "image", None))
+        return run_gui(getattr(args, "paths", None))
 
     if args.cmd == "apply":
         with open(args.params, encoding="utf8") as fh:

@@ -7,7 +7,8 @@ original artwork looked like before it was printed and scanned.
 
 ```
 CoverCleaner.bat                 open the editor
-CoverCleaner.bat Scans           open the editor on a folder
+CoverCleaner.bat Scans           open the editor on a folder (or drop
+                                 scans / folders onto the window or the .bat)
 .venv\Scripts\python -m covercleaner auto Scans -o output --save-params
 .venv\Scripts\python -m covercleaner apply scan.png -p scan.json -o fixed.png
 ```
