@@ -220,6 +220,80 @@ def _grow(labels, colours, img, tol, steps):
     return lab.astype(np.int32)
 
 
+def _thin_strokes(labels, res, img, tolerance):
+    """Adopt thin strokes of a flat colour into its region.
+
+    A stroke only a few pixels wide (the hairline arc of a letter, a thin
+    rule) never passes the region test - its neighbourhood is never quiet -
+    so it keeps its mottle and fringe while the letters around it become
+    solid.  Pixels whose median colour matches a flat colour join it when
+    they form a long, thin component that is darker or lighter than all
+    around it and has flat areas of other colours close by on all sides
+    (not a photo).  Returns (labels, adopted mask).
+    """
+    h, w = labels.shape
+    inside = labels > 0
+    adopted = np.zeros((h, w), bool)
+    if not inside.any():
+        return labels, adopted
+    band = max(10.0, 0.008 * min(h, w))
+    med = cv2.medianBlur(np.ascontiguousarray(img, np.float32), 5)
+    cnt = np.bincount(labels.ravel(), minlength=len(res.colours))
+    groups: dict = {}
+    for i in np.unique(labels[inside]):
+        groups.setdefault(tuple(np.round(res.colours[i], 4)), []).append(int(i))
+    out = labels.copy()
+    k3 = np.ones((3, 3), np.uint8)
+    for members in groups.values():
+        lead = max(members, key=lambda i: cnt[i])
+        cand = (~inside) & (np.abs(med - res.observed[lead]).max(axis=2) < 1.5 * tolerance)
+        if not cand.any():
+            continue
+        n, comp, stats, _ = cv2.connectedComponentsWithStats(cand.astype(np.uint8), 8)
+        if n <= 1:
+            continue
+        depth = cv2.distanceTransform(cand.astype(np.uint8), cv2.DIST_L2, 3)
+        deepest = np.zeros(n, np.float32)
+        np.maximum.at(deepest, comp.ravel(), depth.ravel())
+        ring = (cv2.dilate(cand.astype(np.uint8), k3) > 0) & ~cand
+        rc = cv2.dilate(comp.astype(np.float32), k3).astype(np.int32)
+        ring_n = np.bincount(rc[ring], minlength=n)
+        # flat colour of another kind close by on all sides (not a photo)
+        other_flat = inside & ~np.isin(labels, members)
+        to_other = cv2.distanceTransform((~other_flat).astype(np.uint8), cv2.DIST_L2, 3)
+        ring_flat = np.bincount(rc[ring & (to_other <= 0.5 * band)], minlength=n)
+        between = ring_flat >= 0.8 * np.maximum(ring_n, 1)
+        # a stroke stands out from what surrounds it: just outside it there
+        # is little of its own colour (unlike mottle at a region's edge, or
+        # paper grain), ...
+        grown5 = cv2.dilate(cand.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        outer = (cv2.dilate(cand.astype(np.uint8), np.ones((13, 13), np.uint8)) > 0) & ~grown5
+        rc2 = cv2.dilate(comp.astype(np.float32), np.ones((13, 13), np.uint8)).astype(np.int32)
+        same_col = (np.abs(med - res.observed[lead]).max(axis=2) < 1.5 * tolerance) | np.isin(labels, members)
+        outer_n = np.bincount(rc2[outer], minlength=n)
+        outer_same = np.bincount(rc2[outer & same_col], minlength=n)
+        stands_out = outer_same <= 0.25 * np.maximum(outer_n, 1)
+        # a stroke is darker (or lighter) than everything around it; the
+        # blur band between two other colours lies between them instead
+        lum = med @ np.float32([0.114, 0.587, 0.299])
+        own_lum = float(res.observed[lead] @ np.float32([0.114, 0.587, 0.299]))
+        darker = np.bincount(rc2[outer & (lum < own_lum - 0.08)], minlength=n)
+        lighter = np.bincount(rc2[outer & (lum > own_lum + 0.08)], minlength=n)
+        extreme = np.minimum(darker, lighter) <= 0.1 * np.maximum(outer_n, 1)
+        stands_out &= extreme
+        # ... and it is long and thin, not a blob or speckle of a photo
+        area = stats[:, cv2.CC_STAT_AREA]
+        long_thin = (area >= 400) & (area >= 30.0 * np.maximum(deepest, 1.0) ** 2)
+        take = (deepest <= 0.4 * band) & long_thin & stands_out & between
+        take[0] = False
+        sel = take[comp]
+        # hairline gaps of grain inside the stroke belong to it too
+        sel = (cv2.morphologyEx(sel.astype(np.uint8), cv2.MORPH_CLOSE, k3) > 0) & ~inside
+        out[sel] = lead
+        adopted |= sel
+    return out, adopted
+
+
 def flatten(img: np.ndarray, tolerance: float = 0.06, min_area_pct: float = 0.05,
             strength: float = 1.0, unify: bool = True, crisp_only: bool = True,
             fill_marks_pct: float = 0.0, pure_bw: bool = True, clean_edges: bool = True,
@@ -274,6 +348,7 @@ def flatten(img: np.ndarray, tolerance: float = 0.06, min_area_pct: float = 0.05
                 break
             labels[edge] = hi[edge].astype(np.int32)
             hi, lo = around(labels.astype(np.float32))
+    labels, thin = _thin_strokes(labels, res, img, tolerance)
     inside = labels > 0
     st = float(min(strength, 1.0))
     # Blend by closeness: a pixel near a region's colour (as scanned) becomes
@@ -297,11 +372,12 @@ def flatten(img: np.ndarray, tolerance: float = 0.06, min_area_pct: float = 0.05
     med = cv2.GaussianBlur(cv2.medianBlur(np.ascontiguousarray(img, np.float32), 5), (0, 0), 1.0)
     d = np.where(inside, np.abs(med - seen).max(axis=2), d)
     close = np.clip((tolerance - d) / (0.5 * tolerance), 0.0, 1.0)
+    close[thin] = 1.0                    # adopted strokes matched already
     wgt = cv2.GaussianBlur((close * prox).astype(np.float32), (0, 0), 1.0) * (near_lab > 0)
     out = img + (st * wgt)[:, :, None] * (target - img)
     mask = (wgt > 0.5).astype(np.uint8) * 255
     if clean_edges:
-        out, seam = _rebuild_edges(out, img, smooth, labels, res, tolerance, st, wgt, near_lab)
+        out, seam = _rebuild_edges(out, img, smooth, labels, res, tolerance, st, wgt, near_lab, thin)
         mask[seam] = 255
     if protect is not None and protect.any():
         keep = protect > 0
@@ -310,7 +386,7 @@ def flatten(img: np.ndarray, tolerance: float = 0.06, min_area_pct: float = 0.05
     return out.astype(np.float32), mask
 
 
-def _rebuild_edges(out, img, smooth, labels, res, tolerance, st, wmain, near_lab):
+def _rebuild_edges(out, img, smooth, labels, res, tolerance, st, wmain, near_lab, thin):
     """Redraw the gap between two flat colours as a clean blend of them.
 
     A region stops a few pixels short of its true outline (the local-range
@@ -413,7 +489,7 @@ def _rebuild_edges(out, img, smooth, labels, res, tolerance, st, wmain, near_lab
     major = np.where(alpha >= 0.5, a_, b_)
     cover = np.zeros(ys.size, np.float32)
     for k in np.unique(major):
-        mk = ((ncol == k) & (depth_in > 6)).astype(np.float32)   # region core
+        mk = ((ncol == k) & ((depth_in > 6) | thin)).astype(np.float32)   # region core
         num = cv2.GaussianBlur(wmain * mk, (0, 0), 16.0)
         den_ = cv2.GaussianBlur(mk, (0, 0), 16.0)
         sel = major == k
