@@ -3,6 +3,17 @@
 Version numbers follow semantic versioning: the minor number goes up for
 new features, the patch number for fixes.
 
+## 0.6.0 - 2026-11-13
+
+- Switching between scans in the list no longer starts each one over.
+  Every scan you have opened keeps its settings, your edits (sliders,
+  corners, staple fills), its painted repairs and the analysis report for
+  the session, so going back to it skips Auto. The last few scans - up to
+  four, while at least 2.5 GB of memory stays free - also keep the loaded
+  image and finished result, so going back is instant. An Auto run or
+  render that finishes after you moved on is kept for that scan instead
+  of being thrown away. *Auto* still re-analyses a scan from scratch.
+
 ## 0.5.4 - 2026-11-13
 
 - *Auto-restore all*: choosing the suggested `restored` folder no longer

@@ -277,6 +277,10 @@ where a mistake would damage the picture:
 * **Pick black / Pick white** set the tone references from a click.
 * Hold **Space** (or *Hold: before*) to compare with the unprocessed crop.
 * Settings can be saved as JSON and re-applied from the command line.
+* Switching between scans in the list keeps each one's settings, edits,
+  painted repairs and analysis for the session: going back skips Auto, and
+  for the last few scans (as memory allows) shows the finished result at
+  once. *Auto* re-analyses a scan from scratch.
 
 ## Layout
 

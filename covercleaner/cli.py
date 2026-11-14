@@ -33,6 +33,32 @@ def _collect(inputs: list[str]) -> list[str]:
     return files
 
 
+def available_memory() -> int | None:
+    """Bytes of memory free for use, or None if unknown."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class _Mem(ctypes.Structure):
+                _fields_ = [("len", ctypes.c_ulong), ("load", ctypes.c_ulong),
+                            ("total", ctypes.c_ulonglong), ("avail", ctypes.c_ulonglong),
+                            ("pt", ctypes.c_ulonglong), ("pa", ctypes.c_ulonglong),
+                            ("vt", ctypes.c_ulonglong), ("va", ctypes.c_ulonglong),
+                            ("ve", ctypes.c_ulonglong)]
+            m = _Mem()
+            m.len = ctypes.sizeof(_Mem)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                return int(m.avail)
+        elif os.path.exists("/proc/meminfo"):
+            with open("/proc/meminfo") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return None
+
+
 def default_jobs(n_files: int, gpu: bool = False) -> int:
     """Scans processed at once: about one per four CPU threads (each scan
     still uses a few threads inside OpenCV), at most one per ~3 GB of
@@ -40,20 +66,9 @@ def default_jobs(n_files: int, gpu: bool = False) -> int:
     ML inpainting runs on the GPU - one per ~1.9 GB of free GPU memory."""
     cpus = os.cpu_count() or 1
     jobs = max(1, cpus // 4)
-    try:
-        import ctypes
-
-        class _Mem(ctypes.Structure):
-            _fields_ = [("len", ctypes.c_ulong), ("load", ctypes.c_ulong),
-                        ("total", ctypes.c_ulonglong), ("avail", ctypes.c_ulonglong),
-                        ("pt", ctypes.c_ulonglong), ("pa", ctypes.c_ulonglong),
-                        ("vt", ctypes.c_ulonglong), ("va", ctypes.c_ulonglong),
-                        ("ve", ctypes.c_ulonglong)]
-        m = _Mem(); m.len = ctypes.sizeof(_Mem)
-        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
-            jobs = min(jobs, max(1, int(m.avail / 3e9)))
-    except Exception:
-        pass
+    avail = available_memory()
+    if avail:
+        jobs = min(jobs, max(1, int(avail / 3e9)))
     if gpu:
         free = ml.gpu_free_mb()
         if free:

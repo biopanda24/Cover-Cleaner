@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import traceback
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -155,6 +156,35 @@ GROUPS = [
 # main window
 # --------------------------------------------------------------------------
 
+@dataclass
+class FileSession:
+    """What a file in the list had when you switched away from it.
+
+    Every visited file keeps its settings (Auto's results and your edits),
+    the analysis report and the painted masks (PNG-compressed: a few KB), so
+    switching back skips Auto. The most recently used files also keep the
+    loaded image and the finished result, so switching back is instant."""
+    params: Params
+    report: str = ""
+    masks: tuple | None = None          # (heal PNG, protect PNG)
+    needs_render: bool = True           # no up-to-date result was kept
+    source: np.ndarray | None = None    # "heavy" part, recent files only
+    result: np.ndarray | None = None
+    src_pixmap: object = None
+    res_pixmap: object = None
+
+    def heavy_bytes(self) -> int:
+        return sum(a.nbytes for a in (self.source, self.result) if a is not None)
+
+    def drop_heavy(self) -> None:
+        self.source = self.result = self.src_pixmap = self.res_pixmap = None
+        self.needs_render = True
+
+
+KEEP_HEAVY = 4                          # at most this many recent files in full
+KEEP_FREE = 2.5e9                       # ...while leaving this much memory free
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -179,6 +209,7 @@ class MainWindow(QMainWindow):
         self.net_pool = QThreadPool(self)          # update checks/downloads, apart from renders
         self.net_pool.setMaxThreadCount(1)
         self._auto_path: str | None = None     # file waiting for its Auto run
+        self._sessions: dict[str, FileSession] = {}   # files switched away from
 
         self.view = ImageView()
         self.setCentralWidget(self.view)
@@ -547,6 +578,9 @@ class MainWindow(QMainWindow):
                 self.folder = os.path.commonpath(paths) if paths else self.folder
             except ValueError:              # files on different drives
                 self.folder = os.path.dirname(paths[0])
+        keep = set(paths)
+        for p in [p for p in self._sessions if p not in keep]:
+            del self._sessions[p]
         self.file_list.blockSignals(True)
         self.file_list.clear()
         for p in paths:
@@ -626,9 +660,84 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("No scans (images) among the dropped items.")
 
+    # ---- per-file sessions --------------------------------------------------
+    def _stash_current(self) -> None:
+        """Remember the open file's settings (and, memory allowing, its image
+        and result) before another file is opened."""
+        path = self.path
+        if path is None or self.source is None or self._auto_path == path:
+            return                          # nothing yet (its Auto has not finished)
+        s = FileSession(self.params.copy(), self.report.toPlainText())
+        p = self.pipe
+        if p is not None and p.heal_mask is not None and (p.heal_mask.any()
+                                                          or p.protect_mask.any()):
+            s.masks = (cv2.imencode(".png", p.heal_mask)[1].tobytes(),
+                       cv2.imencode(".png", p.protect_mask)[1].tobytes())
+        s.needs_render = self.result is None or self.dirty or self.busy
+        s.source = self.source
+        s.src_pixmap = self._src_pixmap
+        if not s.needs_render:
+            s.result, s.res_pixmap = self.result, self._res_pixmap
+        self._sessions.pop(path, None)
+        self._sessions[path] = s            # most recent last
+        self._trim_sessions()
+
+    def _trim_sessions(self) -> None:
+        """Keep the images of only the most recent files, within memory."""
+        heavy = [k for k, s in self._sessions.items() if s.source is not None]
+        avail = _cli.available_memory()
+        while heavy and (len(heavy) > KEEP_HEAVY
+                         or (avail is not None and avail < KEEP_FREE)):
+            s = self._sessions[heavy.pop(0)]
+            if avail is not None:
+                avail += s.heavy_bytes()
+            s.drop_heavy()
+
+    def _restore(self, s: FileSession) -> None:
+        """Bring back a remembered file's state (the file itself is loaded)."""
+        self.params = s.params.copy()
+        self.report.setPlainText(s.report)
+        self.mode_combo.blockSignals(True)
+        self.mode_combo.setCurrentIndex(1 if self.params.mode == "ml" else 0)
+        self.mode_combo.blockSignals(False)
+        if s.masks is not None:
+            heal = cv2.imdecode(np.frombuffer(s.masks[0], np.uint8), cv2.IMREAD_UNCHANGED)
+            protect = cv2.imdecode(np.frombuffer(s.masks[1], np.uint8), cv2.IMREAD_UNCHANGED)
+            self.pipe.heal_mask, self.pipe.protect_mask = heal, protect
+            self.pipe.masks_changed()
+        self.sync_controls()
+        name = os.path.basename(self.path)
+        if not s.needs_render and s.result is not None:
+            self.result, self._res_pixmap = s.result, s.res_pixmap
+            self.set_view_mode("result", keep_view=False)
+            self.statusBar().showMessage(f"{name}: your settings and result from earlier "
+                                         "(Auto re-analyses it)")
+        else:
+            self.set_view_mode("result", keep_view=False)
+            self.request_render()
+            self.statusBar().showMessage(f"{name}: your settings from earlier "
+                                         "(Auto re-analyses it)")
+
+    def _file_done_elsewhere(self, path: str, **kw) -> None:
+        """An Auto run or render for a file you have since left finished."""
+        if not any(p == path for p in self._list_paths()):
+            return
+        s = self._sessions.get(path)
+        if "params" in kw:                  # Auto: its settings, to render later
+            if s is None:
+                self._sessions[path] = FileSession(kw["params"], kw["report"])
+        elif s is not None and "result" in kw:  # a render of exactly what is kept
+            if kw["rendered"].to_json() == s.params.to_json() and s.source is not None:
+                s.result, s.res_pixmap = kw["result"], to_pixmap(kw["result"])
+                s.needs_render = False
+
     def load(self, path: str, auto: bool = True):
+        if path != self.path:
+            self._stash_current()
+        s = self._sessions.pop(path, None) if auto else None
         try:
-            self.source = load_image(path)
+            self.source = s.source if (s is not None and s.source is not None) \
+                else load_image(path)
         except Exception as exc:
             QMessageBox.warning(self, "Cover Cleaner", str(exc))
             return
@@ -639,7 +748,8 @@ class MainWindow(QMainWindow):
         self.result = None
         self.report.setPlainText("")
         self.setWindowTitle(self._title(os.path.basename(path)))
-        self._src_pixmap = to_pixmap(self.source)
+        self._src_pixmap = (s.src_pixmap if (s is not None and s.src_pixmap is not None)
+                            else to_pixmap(self.source))
         self._set_enabled(True)
         self.sync_controls()
         self.view.set_overlay(None)
@@ -650,7 +760,9 @@ class MainWindow(QMainWindow):
         self.view.set_mode("pan")
         self.set_view_mode("original", keep_view=False)
         self._auto_path = None              # a pending Auto for the old file is void
-        if auto:
+        if s is not None:
+            self._restore(s)
+        elif auto:
             self.run_auto()
 
     # ---- jobs ------------------------------------------------------------
@@ -703,8 +815,9 @@ class MainWindow(QMainWindow):
         def done(res):
             self.busy = False
             rpath, (params, report) = res
-            if rpath != self.path:
-                return                      # another file was opened meanwhile
+            if rpath != self.path:          # another file was opened meanwhile
+                self._file_done_elsewhere(rpath, params=params, report="\n".join(report))
+                return
             self._auto_path = None
             self.params = params
             self.report.setPlainText("\n".join(report))
@@ -744,6 +857,7 @@ class MainWindow(QMainWindow):
             rpath, img = res
             self.progress.hide()
             if rpath != self.path:
+                self._file_done_elsewhere(rpath, result=img, rendered=params)
                 return
             self.result = img
             self._res_pixmap = to_pixmap(img)
