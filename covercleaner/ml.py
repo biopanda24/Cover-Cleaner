@@ -17,6 +17,7 @@ so no detail is lost to resizing.
 from __future__ import annotations
 
 import os
+import queue
 import threading
 from typing import Callable, Optional
 
@@ -115,17 +116,67 @@ def prepare_gpu_model() -> bool:
     return os.path.isfile(path)
 
 
+class _GpuThread:
+    """One long-lived thread that owns the CUDA session: it creates it and
+    runs every inference, and does nothing else.
+
+    Creating the session on a worker thread that had already processed other
+    scans crashed inside onnxruntime (access violation on the first run),
+    while a session created on a fresh thread was fine. Keeping all CUDA work
+    on a thread of its own avoids that, whichever thread asks."""
+
+    def __init__(self):
+        self._q: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(target=self._loop, name="ml-gpu", daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while True:
+            fn, box, done = self._q.get()
+            try:
+                box["result"] = fn()
+            except BaseException as exc:            # handed back to the caller
+                box["error"] = exc
+            done.set()
+
+    def call(self, fn):
+        if threading.current_thread() is self._thread:
+            return fn()
+        box: dict = {}
+        done = threading.Event()
+        self._q.put((fn, box, done))
+        done.wait()
+        if "error" in box:
+            raise box["error"]
+        return box.get("result")
+
+
+_gpu_thread: Optional[_GpuThread] = None
+_gpu_thread_lock = threading.Lock()
+
+
+def _on_gpu_thread(fn):
+    global _gpu_thread
+    with _gpu_thread_lock:
+        if _gpu_thread is None:
+            _gpu_thread = _GpuThread()
+    return _gpu_thread.call(fn)
+
+
 def _gpu_session():
-    """An onnxruntime CUDA session for the float model, or None."""
-    if not gpu_usable():
+    """An onnxruntime CUDA session for the float model, or None (created on
+    the dedicated GPU thread)."""
+    if not gpu_usable() or not prepare_gpu_model():   # model conversion: not on the GPU thread
         return None
+    return _on_gpu_thread(_make_gpu_session)
+
+
+def _make_gpu_session():
     import onnxruntime as ort
     try:
         if hasattr(ort, "preload_dlls"):
             ort.preload_dlls()                  # CUDA / cuDNN from the nvidia-* wheels
         path = float_model_path()
-        if not prepare_gpu_model():
-            return None
         so = ort.SessionOptions()
         so.log_severity_level = 3
         cuda = {"arena_extend_strategy": "kSameAsRequested"}
@@ -157,7 +208,8 @@ def _infer(patch: np.ndarray, mask: np.ndarray) -> np.ndarray:
     # the network expects the hole to be blanked out
     blob = (rgb * (1.0 - hole[:, :, None])).transpose(2, 0, 1)[None].astype(np.float32)
     if _gpu:
-        out = net.run(None, {"image": blob, "mask": hole[None, None]})[0][0].transpose(1, 2, 0)
+        feed = {"image": blob, "mask": np.ascontiguousarray(hole[None, None])}
+        out = _on_gpu_thread(lambda: net.run(None, feed))[0][0].transpose(1, 2, 0)
     else:
         net.setInput(blob, "image")
         net.setInput(hole[None, None], "mask")

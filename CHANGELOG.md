@@ -3,6 +3,15 @@
 Version numbers follow semantic versioning: the minor number goes up for
 new features, the patch number for fixes.
 
+## 0.7.1 - 2026-11-13
+
+- Fixed a crash with GPU (CUDA) inpainting: opening a folder, letting a
+  scan or two process and moving on could close Cover Cleaner at the first
+  scan that needed ML inpainting (an access violation inside onnxruntime).
+  It happened when the GPU model was first loaded on a background thread
+  that had already processed other scans. The GPU model is now loaded and
+  run on one dedicated thread that does nothing else.
+
 ## 0.7.0 - 2026-11-13
 
 - Crash reports. The editor keeps a session log (files opened, Auto runs,
