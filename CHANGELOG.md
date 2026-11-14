@@ -3,6 +3,22 @@
 Version numbers follow semantic versioning: the minor number goes up for
 new features, the patch number for fixes.
 
+## 0.7.0 - 2026-11-13
+
+- Crash reports. The editor keeps a session log (files opened, Auto runs,
+  renders, background jobs, free memory) and writes a report to the logs
+  folder when something goes wrong: an uncaught Python error in any thread
+  or a failed background job (shown straight away, the program keeps
+  running), or a hard crash inside native code (OpenCV, Qt, onnxruntime, a
+  GPU driver), captured with the stack of every thread as the program dies
+  and offered at the next start. A session that ended without an error
+  (Task Manager, out of memory) is reported too. *Help* has *Open crash
+  reports and logs folder* and *Report a problem on GitHub*. Nothing is sent
+  automatically.
+- Dropping a single image (or choosing one with *File > Open*) opens just
+  that image instead of every scan in its folder. *File > Open* can now
+  pick several images; *Open folder* opens a whole folder.
+
 ## 0.6.0 - 2026-11-13
 
 - Switching between scans in the list no longer starts each one over.

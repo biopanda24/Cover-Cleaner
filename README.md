@@ -46,6 +46,18 @@ downloaded models and your options), and starts it again; if anything goes
 wrong the previous version is put back (see `update.log` in the install
 folder). Copies run from a git checkout update with `git pull` instead.
 
+## Problems and crash reports
+
+The editor keeps a session log and writes a crash report when something
+goes wrong: a Python error (shown straight away; the program keeps
+running) or a hard crash inside native code such as OpenCV, Qt, onnxruntime
+or a GPU driver (the stack of every thread is captured as the program dies,
+and the next start offers the report). *Help > Open crash reports and logs
+folder* opens them: `%APPDATA%\CoverCleaner\logs` on Windows,
+`~/.config/covercleaner/logs` elsewhere. Nothing is sent anywhere; to report
+a problem, use *Help > Report a problem on GitHub* and attach the report
+(it contains the names of the scans you had open).
+
 ## Building the installers
 
 ```

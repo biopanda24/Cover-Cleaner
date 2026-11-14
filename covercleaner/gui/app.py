@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import traceback
 from dataclasses import dataclass
 
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
 
 from .. import __version__
 from .. import cli as _cli
+from .. import crash as _crash
 from .. import descreen as _descreen
 from .. import settings as _settings
 from .. import updater as _updater
@@ -550,9 +552,10 @@ class MainWindow(QMainWindow):
     # ---- files -----------------------------------------------------------
     def open_dialog(self):
         exts = " ".join("*" + e for e in SUPPORTED)
-        path, _ = QFileDialog.getOpenFileName(self, "Open scan", self.folder, f"Images ({exts})")
-        if path:
-            self.set_folder(os.path.dirname(path), select=os.path.basename(path))
+        paths, _ = QFileDialog.getOpenFileNames(self, "Open scans", self.folder,
+                                                f"Images ({exts})")
+        if paths:
+            self.open_paths(paths)
 
     def open_folder_dialog(self):
         folder = QFileDialog.getExistingDirectory(self, "Open folder of scans", self.folder)
@@ -634,17 +637,14 @@ class MainWindow(QMainWindow):
         self.open_paths(paths)
 
     def open_paths(self, paths: list[str]):
-        """Open what was dropped (or given on the command line): one folder
-        shows its scans; one file opens it with the rest of its folder; several
-        files and/or folders are listed together."""
+        """Open what was dropped, chosen or given on the command line: a folder
+        shows its scans; files are listed on their own (just the one, for a
+        single file); several files and/or folders are listed together."""
         paths = [os.path.abspath(p) for p in paths if os.path.exists(p)]
         if not paths:
             return
         if len(paths) == 1 and os.path.isdir(paths[0]):
             self.set_folder(paths[0])
-            return
-        if len(paths) == 1 and paths[0].lower().endswith(SUPPORTED):
-            self.set_folder(os.path.dirname(paths[0]), os.path.basename(paths[0]))
             return
         files: list[str] = []
         for p in paths:
@@ -742,6 +742,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Cover Cleaner", str(exc))
             return
         self.path = path
+        mem = _cli.available_memory()
+        _crash.log.info("open %s (%d x %d)%s, free memory %s", path, self.source.shape[1],
+                        self.source.shape[0], ", remembered" if s is not None else "",
+                        f"{mem / 1e9:.1f} GB" if mem else "?")
         self.pipe = Pipeline(self.source)
         self.params = Params()
         self.params.mode = self._mode()
@@ -792,7 +796,58 @@ class MainWindow(QMainWindow):
         self.busy = False
         self.progress.hide()
         self.statusBar().showMessage("Error")
-        QMessageBox.critical(self, "Cover Cleaner", msg[-1500:])
+        _crash.log.error("background job failed:\n%s", msg)
+        try:
+            report = _crash.write_report("Cover Cleaner error", "A background job failed:\n\n" + msg)
+        except OSError:
+            report = None
+        self.show_crash_report(report, detail=msg.strip().splitlines()[-1] if msg.strip() else "")
+
+    # ---- crash reports ---------------------------------------------------------
+    def show_crash_report(self, path: str | None, after_crash: bool = False, detail: str = ""):
+        """Tell the user about an error or an earlier crash, with its report."""
+        now = time.time()
+        if not after_crash and now - getattr(self, "_last_error_box", 0) < 5:
+            return                              # an error repeating: once is enough
+        self._last_error_box = now
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        box = QMessageBox(self)
+        box.setWindowTitle(APP_NAME)
+        box.setIcon(QMessageBox.Warning if after_crash else QMessageBox.Critical)
+        if after_crash:
+            box.setText("<b>Cover Cleaner closed unexpectedly last time.</b>")
+        else:
+            box.setText("<b>Something went wrong.</b>" + (f"<br>{detail}" if detail else ""))
+        if path:
+            box.setInformativeText(
+                "A report was saved. If you report the problem on GitHub, please attach it "
+                "and say what you were doing. It contains the names of the scans you had "
+                "open, and nothing is sent automatically.")
+        b_open = box.addButton("Open report", QMessageBox.AcceptRole) if path else None
+        b_folder = box.addButton("Open folder", QMessageBox.ActionRole)
+        b_issue = box.addButton("Report on GitHub", QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Close)
+        box.exec()
+        clicked = box.clickedButton()
+        if b_open is not None and clicked is b_open:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        elif clicked is b_folder:
+            self.open_logs_folder()
+        elif clicked is b_issue:
+            self.report_problem()
+
+    def report_problem(self):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl(_crash.ISSUES_URL))
+
+    def open_logs_folder(self):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        d = _crash.log_dir()
+        os.makedirs(d, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(d))
 
     def run_auto(self):
         if self.source is None:
@@ -805,6 +860,7 @@ class MainWindow(QMainWindow):
             return
         self.busy = True
         src, pipe, path, mode = self.source, self.pipe, self.path, self._mode()
+        _crash.log.info("Auto (%s): %s", mode, os.path.basename(path))
         st = self.settings
 
         def work(progress):
@@ -815,6 +871,7 @@ class MainWindow(QMainWindow):
         def done(res):
             self.busy = False
             rpath, (params, report) = res
+            _crash.log.info("Auto done: %s", os.path.basename(rpath))
             if rpath != self.path:          # another file was opened meanwhile
                 self._file_done_elsewhere(rpath, params=params, report="\n".join(report))
                 return
@@ -848,6 +905,8 @@ class MainWindow(QMainWindow):
         self.busy = True
         self.dirty = False
         pipe, params, path = self.pipe, self.params.copy(), self.path
+        t0 = time.time()
+        _crash.log.info("render (%s): %s", params.mode, os.path.basename(path))
 
         def work(progress):
             return path, pipe.run(params, progress=progress)
@@ -856,6 +915,7 @@ class MainWindow(QMainWindow):
             self.busy = False
             rpath, img = res
             self.progress.hide()
+            _crash.log.info("render done in %.1f s: %s", time.time() - t0, os.path.basename(rpath))
             if rpath != self.path:
                 self._file_done_elsewhere(rpath, result=img, rendered=params)
                 return
@@ -1214,6 +1274,7 @@ class MainWindow(QMainWindow):
 
             def emit(text):
                 log.append(text)
+                _crash.log.info("batch: %s", text)
 
             _cli.run_batch(files, st, out, emit=emit, output_is_dir=True,
                            progress=lambda k, n: progress(f"Restoring {k}/{n}", k / n))
@@ -1253,6 +1314,13 @@ class MainWindow(QMainWindow):
         opt.triggered.connect(self.open_options)
         m.addAction(opt)
         m = mb.addMenu("&Help")
+        logs = QAction("Open crash reports and &logs folder", self)
+        logs.triggered.connect(self.open_logs_folder)
+        m.addAction(logs)
+        issue = QAction("&Report a problem on GitHub…", self)
+        issue.triggered.connect(self.report_problem)
+        m.addAction(issue)
+        m.addSeparator()
         about = QAction(f"&About {APP_NAME}", self)
         about.triggered.connect(self.show_about)
         m.addAction(about)
@@ -1391,6 +1459,11 @@ def app_icon():
     return icon
 
 
+class _ErrorBridge(QObject):
+    """Carries 'an error report was written' from any thread to the window."""
+    error = Signal(str)
+
+
 def run_gui(paths=None) -> int:
     if sys.platform == "win32":
         # Its own taskbar entry and icon, instead of being grouped under Python.
@@ -1403,10 +1476,20 @@ def run_gui(paths=None) -> int:
     app.setApplicationName(APP_NAME)
     app.setDesktopFileName("cover-cleaner")        # matches the Linux .desktop file
     app.setWindowIcon(app_icon())
+    bridge = _ErrorBridge()
+    previous = _crash.install(on_error=bridge.error.emit)
+    from PySide6.QtCore import qInstallMessageHandler
+    qInstallMessageHandler(_crash.qt_message_handler)
     win = MainWindow()
+    bridge.error.connect(lambda path: win.show_crash_report(path))
     win.show()
+    if previous:
+        QTimer.singleShot(800, lambda: win.show_crash_report(previous, after_crash=True))
     if isinstance(paths, str):
         paths = [paths]
     if paths:
         win.open_paths(list(paths))
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        _crash.clean_exit()
