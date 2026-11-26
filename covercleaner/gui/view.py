@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPointF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (QBrush, QColor, QImage, QPainter, QPainterPath, QPen,
                            QPixmap, QPolygonF)
 from PySide6.QtWidgets import (QGraphicsEllipseItem, QGraphicsItem, QGraphicsPathItem,
@@ -61,6 +61,7 @@ class ImageView(QGraphicsView):
     cornerReleased = Signal()
     strokeFinished = Signal(object)        # list of (x, y) in image pixels
     picked = Signal(float, float)
+    cropped = Signal(float, float, float, float)   # x0, y0, x1, y1 in image pixels
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -79,14 +80,25 @@ class ImageView(QGraphicsView):
         self._outline.setZValue(10)
         self._stroke_item = QGraphicsPathItem()
         self._stroke_item.setZValue(15)
-        for it in (self._pix, self._overlay, self._outline, self._stroke_item):
+        # drag-to-crop: the picture outside the box is dimmed while dragging
+        self._crop_shade = QGraphicsPathItem()
+        self._crop_shade.setBrush(QColor(0, 0, 0, 140))
+        self._crop_shade.setPen(QPen(Qt.NoPen))
+        self._crop_shade.setZValue(20)
+        self._crop_box = QGraphicsPathItem()
+        box_pen = QPen(QColor(255, 255, 255), 0, Qt.DashLine)
+        self._crop_box.setPen(box_pen)
+        self._crop_box.setZValue(21)
+        self._crop_start: tuple[float, float] | None = None
+        for it in (self._pix, self._overlay, self._outline, self._stroke_item,
+                   self._crop_shade, self._crop_box):
             self.scene().addItem(it)
         self._handles = [_Handle(i, self) for i in range(4)]
         for hnd in self._handles:
             self.scene().addItem(hnd)
             hnd.hide()
         self._moving_handles = False
-        self.mode = "pan"                 # pan | brush | pick
+        self.mode = "pan"                 # pan | brush | pick | crop
         self.brush_size = 24
         self.brush_color = QColor(255, 60, 60, 150)
         self._stroke: list[tuple[float, float]] = []
@@ -132,6 +144,8 @@ class ImageView(QGraphicsView):
         self.resetTransform()
 
     def set_mode(self, mode: str) -> None:
+        if mode != "crop":
+            self._crop_clear()
         self.mode = mode
         self.setDragMode(QGraphicsView.ScrollHandDrag if mode == "pan" else QGraphicsView.NoDrag)
         self.viewport().setCursor(Qt.CrossCursor if mode != "pan" else Qt.OpenHandCursor)
@@ -157,12 +171,19 @@ class ImageView(QGraphicsView):
         if event.button() == Qt.LeftButton and self.mode == "pick":
             self.picked.emit(*self._img_pos(event))
             return
+        if event.button() == Qt.LeftButton and self.mode == "crop":
+            self._crop_start = self._clamp(*self._img_pos(event))
+            self._crop_draw(*self._crop_start)
+            return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if self._stroke and self.mode == "brush":
             self._stroke.append(self._img_pos(event))
             self._draw_stroke()
+            return
+        if self._crop_start is not None and self.mode == "crop":
+            self._crop_draw(*self._clamp(*self._img_pos(event)))
             return
         super().mouseMoveEvent(event)
 
@@ -172,7 +193,43 @@ class ImageView(QGraphicsView):
             self._stroke_item.setPath(QPainterPath())
             self.strokeFinished.emit(pts)
             return
+        if self._crop_start is not None and self.mode == "crop":
+            (x0, y0), (x1, y1) = self._crop_start, self._clamp(*self._img_pos(event))
+            self._crop_clear()
+            x0, x1 = sorted((x0, x1))
+            y0, y1 = sorted((y0, y1))
+            if x1 - x0 >= 8 and y1 - y0 >= 8:      # a click, not a box: ignore
+                self.cropped.emit(x0, y0, x1, y1)
+            return
         super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape and self._crop_start is not None:
+            self._crop_clear()
+            return
+        super().keyPressEvent(event)
+
+    # ---- drag-to-crop ----------------------------------------------------------
+    def _clamp(self, x: float, y: float) -> tuple[float, float]:
+        r = self._pix.boundingRect()
+        return min(max(x, 0.0), r.width()), min(max(y, 0.0), r.height())
+
+    def _crop_draw(self, x: float, y: float) -> None:
+        x0, y0 = self._crop_start
+        box = QRectF(QPointF(min(x0, x), min(y0, y)), QPointF(max(x0, x), max(y0, y)))
+        shade = QPainterPath()
+        shade.addRect(self._pix.boundingRect())
+        inner = QPainterPath()
+        inner.addRect(box)
+        self._crop_shade.setPath(shade.subtracted(inner))
+        outline = QPainterPath()
+        outline.addRect(box)
+        self._crop_box.setPath(outline)
+
+    def _crop_clear(self) -> None:
+        self._crop_start = None
+        self._crop_shade.setPath(QPainterPath())
+        self._crop_box.setPath(QPainterPath())
 
     def _draw_stroke(self):
         path = QPainterPath(QPointF(*self._stroke[0]))

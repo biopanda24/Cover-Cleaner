@@ -28,6 +28,27 @@ class GeometryParams:
     angle: float = 0.0  # fine rotation, degrees counter-clockwise
 
 
+# `trim` is stored for the sides of the straightened scan *before* the quarter
+# turns (so Auto's values and saved settings keep their meaning). The editor
+# shows and edits it for the sides as they appear after turning:
+def trim_to_view(trim, rotate90: int) -> list:
+    """Stored [left, top, right, bottom] -> as seen after `rotate90` clockwise turns."""
+    l, t, r, b = (int(v) for v in trim)
+    cw = [t, r, b, l]                               # clockwise from the top
+    k = int(rotate90) % 4
+    seen = [cw[(i - k) % 4] for i in range(4)]       # side now at top, right, bottom, left
+    return [seen[3], seen[0], seen[1], seen[2]]
+
+
+def trim_from_view(view, rotate90: int) -> list:
+    """Inverse of trim_to_view."""
+    l, t, r, b = (int(v) for v in view)
+    seen = [t, r, b, l]
+    k = int(rotate90) % 4
+    cw = [seen[(i + k) % 4] for i in range(4)]
+    return [cw[3], cw[0], cw[1], cw[2]]
+
+
 @dataclass
 class DescreenParams:
     """Remove the halftone (print screen) pattern."""

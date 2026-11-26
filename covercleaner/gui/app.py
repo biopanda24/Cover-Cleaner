@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import cv2
@@ -21,6 +23,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
 from .. import __version__
 from .. import cli as _cli
 from .. import crash as _crash
+from .. import scratch as _scratch
 from .. import descreen as _descreen
 from .. import settings as _settings
 from .. import updater as _updater
@@ -28,7 +31,7 @@ from .. import geometry as _geometry
 from .. import ml as _ml
 from ..auto import auto_params
 from ..imageio import SUPPORTED, load_image, read_dpi, save_image
-from ..params import Params
+from ..params import Params, trim_from_view, trim_to_view
 from ..pipeline import Pipeline
 from .options import APP_NAME, EXPERIMENTAL, AboutDialog, OptionsDialog, UpdateDialog
 from .view import ImageView, mask_pixmap, to_pixmap
@@ -164,8 +167,9 @@ class FileSession:
 
     Every visited file keeps its settings (Auto's results and your edits),
     the analysis report and the painted masks (PNG-compressed: a few KB), so
-    switching back skips Auto. The most recently used files also keep the
-    loaded image and the finished result, so switching back is instant."""
+    switching back skips Auto. Its finished result is kept in the scratch
+    folder, so switching back needs no processing either; the most recently
+    used files also keep the image and result in memory (instant)."""
     params: Params
     report: str = ""
     masks: tuple | None = None          # (heal PNG, protect PNG)
@@ -174,13 +178,15 @@ class FileSession:
     result: np.ndarray | None = None
     src_pixmap: object = None
     res_pixmap: object = None
+    result_file: str | None = None      # the result, in the scratch folder
+    auto_trim: list | None = None       # Auto's trim (Reset trim)
 
     def heavy_bytes(self) -> int:
         return sum(a.nbytes for a in (self.source, self.result) if a is not None)
 
     def drop_heavy(self) -> None:
         self.source = self.result = self.src_pixmap = self.res_pixmap = None
-        self.needs_render = True
+        self.needs_render = self.result_file is None
 
 
 KEEP_HEAVY = 4                          # at most this many recent files in full
@@ -212,6 +218,14 @@ class MainWindow(QMainWindow):
         self.net_pool.setMaxThreadCount(1)
         self._auto_path: str | None = None     # file waiting for its Auto run
         self._sessions: dict[str, FileSession] = {}   # files switched away from
+        self.scratch = _scratch.Scratch(self.settings.scratch_dir)
+        self._spiller = ThreadPoolExecutor(1)      # writes results to the scratch folder
+        self._result_file: str | None = None       # scratch copy of self.result, if any
+        self._auto_trim: list | None = None
+        self._proc_stop: threading.Event | None = None   # Process all is running
+        self._proc_bridge = _ProcessBridge()
+        self._proc_bridge.file_done.connect(self._processed_one)
+        self._proc_bridge.finished.connect(self._processing_finished)
 
         self.view = ImageView()
         self.setCentralWidget(self.view)
@@ -219,6 +233,7 @@ class MainWindow(QMainWindow):
         self.view.cornerReleased.connect(self.request_render)
         self.view.strokeFinished.connect(self._stroke_finished)
         self.view.picked.connect(self._picked)
+        self.view.cropped.connect(self._cropped)
 
         self.setAcceptDrops(True)                 # drop scans or folders anywhere
         self.view.setAcceptDrops(False)
@@ -278,6 +293,12 @@ class MainWindow(QMainWindow):
         self.act_save = act("Save result…", self.save_dialog, "Ctrl+S")
         self.act_batch = act("Auto-restore all…", self.batch_dialog, None,
                              "Run Auto on every file in the list and save the results")
+        self.act_process_all = act("Process all", self.process_all, None,
+                                   "Run Auto on every file in the list in the background "
+                                   "without saving, to check and adjust each one; then "
+                                   "Save all")
+        self.act_save_all = act("Save all…", self.save_all_dialog, None,
+                                "Save every file in the list as it is now, with your changes")
         self.act_load_settings = act("Load settings…", self.load_settings)
         self.act_save_settings = act("Save settings…", self.save_settings)
         tb.addSeparator()
@@ -340,12 +361,24 @@ class MainWindow(QMainWindow):
         grid = QGridLayout()
         self.trim_spins = []
         for i, name in enumerate(("Trim left", "top", "right", "bottom")):
-            sp = QSpinBox(); sp.setRange(0, 2000); sp.setSuffix(" px")
+            sp = QSpinBox(); sp.setRange(0, 20000); sp.setSuffix(" px")
             sp.valueChanged.connect(lambda v, k=i: self._set_trim(k, v))
             grid.addWidget(QLabel(name), i // 2, (i % 2) * 2)
             grid.addWidget(sp, i // 2, (i % 2) * 2 + 1)
             self.trim_spins.append(sp)
         lay.addLayout(grid)
+        row = QHBoxLayout()
+        self.btn_crop = QPushButton("✂ Drag to crop")
+        self.btn_crop.setCheckable(True)
+        self.btn_crop.setToolTip("Drag a box on the result to keep just that part (sets the "
+                                 "trim). Esc cancels a box being dragged.")
+        self.btn_crop.toggled.connect(self._crop_mode)
+        row.addWidget(self.btn_crop)
+        b = QPushButton("Reset trim")
+        b.setToolTip("Back to the trim Auto chose")
+        b.clicked.connect(self._reset_trim)
+        row.addWidget(b)
+        lay.addLayout(row)
         row = QHBoxLayout()
         for text, step in (("⟲ Rotate left", -1), ("Rotate right ⟳", 1)):
             b = QPushButton(text); b.clicked.connect(lambda _=False, s=step: self._rotate(s))
@@ -502,9 +535,73 @@ class MainWindow(QMainWindow):
         self._set(group, "enabled", on)
 
     def _set_trim(self, k: int, v: int):
-        if self.params.geometry.trim[k] != v:
-            self.params.geometry.trim[k] = int(v)
+        """Trim box k (left, top, right, bottom as seen now) changed."""
+        g = self.params.geometry
+        view = trim_to_view(g.trim, g.rotate90)
+        if view[k] != v:
+            view[k] = int(v)
+            g.trim = trim_from_view(view, g.rotate90)
             self._geometry_edited()
+            self.request_render()
+
+    # ---- drag-to-crop ----------------------------------------------------------
+    def _crop_mode(self, on: bool):
+        if on:
+            if self.source is None:
+                self.btn_crop.setChecked(False)
+                return
+            self.brush_combo.setCurrentIndex(0)
+            self.pick_target = None
+            if self.view_mode != "result":
+                self.set_view_mode("result")
+            self.view.set_mode("crop")
+            self.statusBar().showMessage("Drag a box on the result around what to keep.")
+        elif self.view.mode == "crop":
+            self.view.set_mode("pan")
+
+    def _cropped(self, x0: float, y0: float, x1: float, y1: float):
+        """A box was dragged on the result: keep just that part."""
+        self.btn_crop.setChecked(False)
+        if self.result is None or self.busy or self.dirty:
+            self.statusBar().showMessage("Still processing - drag the box again in a moment.")
+            return
+        g = self.params.geometry
+        scale = float(self.params.output.scale) or 1.0
+        gh, gw = (int(round(n / scale)) for n in self.result.shape[:2])
+        cached = getattr(self.pipe, "_cache", {}).get("geometry")
+        if cached is not None:                      # exact size of the straightened image
+            gh, gw = cached[1].shape[:2]
+        gx0, gy0 = int(round(x0 / scale)), int(round(y0 / scale))
+        gx1, gy1 = min(gw, int(round(x1 / scale))), min(gh, int(round(y1 / scale)))
+        if gx1 - gx0 < 16 or gy1 - gy0 < 16:
+            return
+        view = trim_to_view(g.trim, g.rotate90)
+        view = [view[0] + gx0, view[1] + gy0, view[2] + gw - gx1, view[3] + gh - gy1]
+        g.trim = trim_from_view(view, g.rotate90)
+        # painted repairs and staple fills are in these pixels: cut them to the box
+        p = self.pipe
+        if p is not None and p.heal_mask is not None and p.heal_mask.shape[:2] == (gh, gw):
+            p.heal_mask = np.ascontiguousarray(p.heal_mask[gy0:gy1, gx0:gx1])
+            p.protect_mask = np.ascontiguousarray(p.protect_mask[gy0:gy1, gx0:gx1])
+            p.masks_changed()
+        kept = []
+        for px0, py0, px1, py1 in self.params.defects.patches:
+            nx0, ny0 = max(0, px0 - gx0), max(0, py0 - gy0)
+            nx1, ny1 = min(gx1 - gx0, px1 - gx0), min(gy1 - gy0, py1 - gy0)
+            if nx1 > nx0 and ny1 > ny0:
+                kept.append([nx0, ny0, nx1, ny1])
+        self.params.defects.patches = kept
+        self.sync_controls()
+        self.request_render()
+        self.statusBar().showMessage(f"Cropped to {gx1 - gx0} x {gy1 - gy0} px "
+                                     "(Reset trim goes back to Auto's crop).")
+
+    def _reset_trim(self):
+        auto = getattr(self, "_auto_trim", None) or [0, 0, 0, 0]
+        if list(self.params.geometry.trim) != list(auto):
+            self.params.geometry.trim = list(auto)
+            self._geometry_edited()
+            self.sync_controls()
             self.request_render()
 
     def _set_side(self, k: int, on: bool):
@@ -521,6 +618,7 @@ class MainWindow(QMainWindow):
     def _rotate(self, step: int):
         self.params.geometry.rotate90 = (self.params.geometry.rotate90 + step) % 4
         self._geometry_edited()
+        self.sync_controls()                        # the trim boxes follow the turn
         self.request_render()
 
     def sync_controls(self):
@@ -534,7 +632,7 @@ class MainWindow(QMainWindow):
             else:
                 wdg.setChecked(bool(val))
             wdg.blockSignals(False)
-        for sp, v in zip(self.trim_spins, p.geometry.trim):
+        for sp, v in zip(self.trim_spins, trim_to_view(p.geometry.trim, p.geometry.rotate90)):
             sp.blockSignals(True); sp.setValue(int(v)); sp.blockSignals(False)
         for cb, v in zip(self.side_checks, p.shading.sides):
             cb.blockSignals(True); cb.setChecked(bool(v)); cb.blockSignals(False)
@@ -583,7 +681,7 @@ class MainWindow(QMainWindow):
                 self.folder = os.path.dirname(paths[0])
         keep = set(paths)
         for p in [p for p in self._sessions if p not in keep]:
-            del self._sessions[p]
+            self.scratch.remove(self._sessions.pop(p).result_file)
         self.file_list.blockSignals(True)
         self.file_list.clear()
         for p in paths:
@@ -596,8 +694,10 @@ class MainWindow(QMainWindow):
                     label = p
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, p)
+            item.setData(Qt.UserRole + 1, label)
             item.setToolTip(p)
             self.file_list.addItem(item)
+            self._mark(p, item)
         self.file_list.blockSignals(False)
         if paths:
             sel = os.path.abspath(select) if select else None
@@ -676,11 +776,37 @@ class MainWindow(QMainWindow):
         s.needs_render = self.result is None or self.dirty or self.busy
         s.source = self.source
         s.src_pixmap = self._src_pixmap
+        s.auto_trim = self._auto_trim
         if not s.needs_render:
             s.result, s.res_pixmap = self.result, self._res_pixmap
+            s.result_file = self._result_file       # already in the scratch folder?
+            if s.result_file is None:
+                self._spill(s)
+        elif self._result_file:
+            self.scratch.remove(self._result_file)  # out of date
+        self._result_file = None
         self._sessions.pop(path, None)
         self._sessions[path] = s            # most recent last
         self._trim_sessions()
+        self._mark(path)
+
+    def _spill(self, s: FileSession) -> None:
+        """Write a session's result to the scratch folder in the background."""
+        img = s.result
+        free = self.scratch.free_bytes()
+        if img is None or (free is not None and free < img.nbytes // 2 + 1_000_000_000):
+            return                                  # little disk space: it re-renders later
+
+        def write():
+            try:
+                s.result_file = _scratch.save_result(self.scratch.new_path(), img)
+                s.needs_render = False
+            except OSError as exc:
+                _crash.log.warning("scratch folder: %s", exc)
+        self._spiller.submit(write)
+
+    def _wait_for_spills(self) -> None:
+        self._spiller.submit(lambda: None).result()
 
     def _trim_sessions(self) -> None:
         """Keep the images of only the most recent files, within memory."""
@@ -706,9 +832,18 @@ class MainWindow(QMainWindow):
             self.pipe.heal_mask, self.pipe.protect_mask = heal, protect
             self.pipe.masks_changed()
         self.sync_controls()
+        self._auto_trim = s.auto_trim
         name = os.path.basename(self.path)
-        if not s.needs_render and s.result is not None:
-            self.result, self._res_pixmap = s.result, s.res_pixmap
+        result = s.result
+        if not s.needs_render and result is None and s.result_file:
+            try:
+                result = _scratch.load_result(s.result_file)
+            except (OSError, ValueError):
+                result = None
+        if not s.needs_render and result is not None:
+            self.result = result
+            self._res_pixmap = s.res_pixmap if s.res_pixmap is not None else to_pixmap(result)
+            self._result_file = s.result_file
             self.set_view_mode("result", keep_view=False)
             self.statusBar().showMessage(f"{name}: your settings and result from earlier "
                                          "(Auto re-analyses it)")
@@ -727,9 +862,15 @@ class MainWindow(QMainWindow):
             if s is None:
                 self._sessions[path] = FileSession(kw["params"], kw["report"])
         elif s is not None and "result" in kw:  # a render of exactly what is kept
-            if kw["rendered"].to_json() == s.params.to_json() and s.source is not None:
-                s.result, s.res_pixmap = kw["result"], to_pixmap(kw["result"])
-                s.needs_render = False
+            if kw["rendered"].to_json() == s.params.to_json():
+                s.result = kw["result"]
+                if s.source is not None:            # still kept in memory
+                    s.res_pixmap = to_pixmap(kw["result"])
+                    s.needs_render = False
+                self._spill(s)
+                if s.source is None:
+                    s.result = None                 # the scratch copy is enough
+                self._mark(path)
 
     def load(self, path: str, auto: bool = True):
         if path != self.path:
@@ -742,6 +883,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Cover Cleaner", str(exc))
             return
         self.path = path
+        self._auto_trim = None
+        self._result_file = None
         mem = _cli.available_memory()
         _crash.log.info("open %s (%d x %d)%s, free memory %s", path, self.source.shape[1],
                         self.source.shape[0], ", remembered" if s is not None else "",
@@ -761,6 +904,9 @@ class MainWindow(QMainWindow):
         self.brush_combo.blockSignals(True)
         self.brush_combo.setCurrentIndex(0)
         self.brush_combo.blockSignals(False)
+        self.btn_crop.blockSignals(True)
+        self.btn_crop.setChecked(False)
+        self.btn_crop.blockSignals(False)
         self.view.set_mode("pan")
         self.set_view_mode("original", keep_view=False)
         self._auto_path = None              # a pending Auto for the old file is void
@@ -877,6 +1023,7 @@ class MainWindow(QMainWindow):
                 return
             self._auto_path = None
             self.params = params
+            self._auto_trim = list(params.geometry.trim)
             self.report.setPlainText("\n".join(report))
             self.sync_controls()
             self.set_view_mode("result")
@@ -919,6 +1066,9 @@ class MainWindow(QMainWindow):
             if rpath != self.path:
                 self._file_done_elsewhere(rpath, result=img, rendered=params)
                 return
+            if self._result_file:
+                self.scratch.remove(self._result_file)
+                self._result_file = None
             self.result = img
             self._res_pixmap = to_pixmap(img)
             if self.view_mode == "result":
@@ -937,6 +1087,8 @@ class MainWindow(QMainWindow):
         if self.source is None:
             return
         if mode == "original":
+            if self.btn_crop.isChecked():
+                self.btn_crop.setChecked(False)          # cropping works on the result
             self.view.set_overlay(None)
             self.view.set_image(self._src_pixmap, keep_view)
             self._refresh_outline()
@@ -1094,6 +1246,10 @@ class MainWindow(QMainWindow):
 
     def _brush_changed(self, *_):
         idx = self.brush_combo.currentIndex()
+        if idx > 0 and self.btn_crop.isChecked():
+            self.btn_crop.blockSignals(True)
+            self.btn_crop.setChecked(False)
+            self.btn_crop.blockSignals(False)
         if idx > 0 and self.view_mode != "result":
             self.set_view_mode("result")
         self.view.brush_size = self.brush_size.value()
@@ -1288,6 +1444,192 @@ class MainWindow(QMainWindow):
 
         self._run_job(work, done, "Batch…")
 
+    # ---- process all (no saving) and save all ------------------------------------
+    def _mark(self, path: str, item=None) -> None:
+        """✓ in the list for files whose result is ready."""
+        if item is None:
+            item = next((self.file_list.item(i) for i in range(self.file_list.count())
+                         if self.file_list.item(i).data(Qt.UserRole) == path), None)
+            if item is None:
+                return
+        s = self._sessions.get(path)
+        ready = s is not None and not s.needs_render
+        label = item.data(Qt.UserRole + 1) or item.text()
+        item.setText(("✓ " if ready else "    ") + label)
+
+    def process_all(self):
+        """Auto on every file in the list, in the background, without saving."""
+        if self._proc_stop is not None:            # running: this is Stop
+            self._proc_stop.set()
+            self.act_process_all.setEnabled(False)
+            self.statusBar().showMessage("Stopping after the scans already being processed…")
+            return
+        files = [p for p in self._list_paths() if p != self.path and p not in self._sessions]
+        if not files:
+            self.statusBar().showMessage("Every file in the list is already processed.")
+            return
+        st = _settings.AppSettings.from_dict(self.settings.to_dict())
+        mode = self._mode()
+        use_gpu = mode == "ml" and _ml.gpu_usable()
+        jobs = st.jobs if st.jobs > 0 else _cli.default_jobs(len(files), use_gpu)
+        opts = dict(settings=st.to_dict(), mode=mode)
+        tasks = [(p, self.scratch.new_path(), opts) for p in files]
+        stop = self._proc_stop = threading.Event()
+        bridge = self._proc_bridge
+        self._proc_count = [0, len(files), 0]          # done, total, failed
+        self.act_process_all.setText("Stop processing")
+        self.act_process_all.setToolTip("Stop processing the list (scans already done are kept)")
+        self.act_save_all.setEnabled(False)
+        self.act_batch.setEnabled(False)
+        _crash.log.info("process all: %d scans, %d at a time", len(files), jobs)
+        self.statusBar().showMessage(f"Processing {len(files)} scans in the background, "
+                                     f"{jobs} at a time…")
+
+        def run():
+            try:
+                if use_gpu and jobs > 1:
+                    _ml.prepare_gpu_model()
+                _cli.run_pool(_cli.process_one, tasks, jobs,
+                              lambda t, r: bridge.file_done.emit(
+                                  r if isinstance(r, dict) else
+                                  dict(path=t[0], ok=False, error=str(r))), stop)
+            finally:
+                bridge.finished.emit()
+
+        threading.Thread(target=run, name="process-all", daemon=True).start()
+
+    def _processed_one(self, r: dict):
+        n = self._proc_count
+        n[0] += 1
+        path, rf = r.get("path"), r.get("result_file")
+        if not r.get("ok"):
+            n[2] += 1
+            _crash.log.warning("process all: %s failed: %s", path, r.get("error"))
+            self.scratch.remove(rf)
+        elif path == self.path or path in self._sessions or path not in self._list_paths():
+            self.scratch.remove(rf)                   # opened (or gone) meanwhile: yours wins
+        else:
+            params = Params.from_json(r["params"])
+            self._sessions[path] = FileSession(params, "\n".join(r.get("report", [])),
+                                               needs_render=False, result_file=rf,
+                                               auto_trim=list(params.geometry.trim))
+            self._sessions[path] = self._sessions.pop(path)
+            self._mark(path)
+        self.statusBar().showMessage(f"Processing in the background: {n[0]} of {n[1]} done"
+                                     + (f", {n[2]} failed" if n[2] else "") + "…")
+
+    def _processing_finished(self):
+        done, total, failed = self._proc_count
+        stopped = self._proc_stop is not None and self._proc_stop.is_set()
+        self._proc_stop = None
+        self.act_process_all.setText("Process all")
+        self.act_process_all.setToolTip("Run Auto on every file in the list in the background "
+                                        "without saving; then Save all")
+        for a in (self.act_process_all, self.act_save_all, self.act_batch):
+            a.setEnabled(True)
+        self.statusBar().showMessage(
+            ("Stopped: " if stopped else "Processing finished: ") + f"{done - failed} of {total} "
+            "scans ready" + (f", {failed} failed (see the log)" if failed else "")
+            + ". Check them in the list, then Save all.")
+
+    def save_all_dialog(self):
+        """Save every file in the list as it is now."""
+        files = self._list_paths()
+        if not files:
+            return
+        if self.busy or self._proc_stop is not None:
+            QMessageBox.information(self, APP_NAME, "Please wait until the current processing "
+                                    "has finished, then Save all.")
+            return
+        start = self.settings.save_dir or os.path.join(self.folder, "restored")
+        created = self._prepare_dir(start)
+        out = QFileDialog.getExistingDirectory(self, "Save all into folder", start)
+        if out:
+            src_dirs = {os.path.normcase(os.path.dirname(f)) for f in files}
+            if os.path.normcase(os.path.abspath(out)) in src_dirs:
+                out = os.path.join(out, "restored")   # never overwrite the scans
+        self._drop_if_unused(start, created, out)
+        if not out:
+            return
+        # what each file is now: a finished result, settings to render, or nothing yet
+        self._wait_for_spills()
+        jobs_for: dict[str, dict] = {}
+        for p in files:
+            if p == self.path and self.source is not None and self._auto_path != p:
+                job = {"params": self.params.to_json()}
+                if self.result is not None and not self.dirty:
+                    if not self._result_file:
+                        try:
+                            self._result_file = _scratch.save_result(self.scratch.new_path(),
+                                                                     self.result)
+                        except OSError:
+                            pass
+                    job["result_file"] = self._result_file
+                if not job.get("result_file"):
+                    pm = self.pipe
+                    if pm is not None and pm.heal_mask is not None and (
+                            pm.heal_mask.any() or pm.protect_mask.any()):
+                        job["masks"] = (cv2.imencode(".png", pm.heal_mask)[1].tobytes(),
+                                        cv2.imencode(".png", pm.protect_mask)[1].tobytes())
+            elif p in self._sessions:
+                s = self._sessions[p]
+                job = {"params": s.params.to_json()}
+                if not s.needs_render and s.result_file:
+                    job["result_file"] = s.result_file
+                elif s.masks:
+                    job["masks"] = s.masks
+            else:
+                job = {}
+            jobs_for[p] = job
+        ready = sum(1 for j in jobs_for.values() if j.get("result_file"))
+        render = sum(1 for j in jobs_for.values() if j.get("params") and not j.get("result_file"))
+        fresh = len(files) - ready - render
+        parts = [f"{ready} as they are now"] if ready else []
+        if render:
+            parts.append(f"{render} rendered from your settings")
+        if fresh:
+            parts.append(f"{fresh} not processed yet - Auto first")
+        if QMessageBox.question(self, APP_NAME, f"Save {len(files)} scans into\n{out}?\n\n"
+                                + "; ".join(parts) + ".") != QMessageBox.Yes:
+            return
+        st = _settings.AppSettings.from_dict(self.settings.to_dict())
+        st.pipeline = self._mode()
+        st.bits = int(self.bits.currentText())
+        dsts = _cli.plan_outputs(files, st, out, output_is_dir=True)
+        opts = dict(settings=st.to_dict(), analyze_only=False)
+        tasks = [(p, dsts[p], opts, jobs_for[p]) for p in files]
+        heavy = render + fresh
+        use_gpu = st.mode(_ml.available()) == "ml" and _ml.gpu_usable()
+        n_jobs = 1 if not heavy else (st.jobs if st.jobs > 0
+                                      else _cli.default_jobs(heavy, use_gpu))
+        self.busy = True
+        _crash.log.info("save all: %d scans (%d ready, %d to render, %d new) into %s",
+                        len(files), ready, render, fresh, out)
+
+        def work(progress):
+            log, count = [], [0, 0]
+
+            def on_result(task, res):
+                count[0] += 1
+                text, ok = res if isinstance(res, tuple) else (f"== {task[0]}\n   FAILED: {res}",
+                                                               False)
+                count[1] += not ok
+                log.append(f"[{count[0]}/{len(tasks)}] {text}")
+                _crash.log.info("save all: %s", text.splitlines()[-1].strip())
+                progress(f"Saving {count[0]}/{len(tasks)}", count[0] / len(tasks))
+            _cli.run_pool(_cli.save_one, tasks, n_jobs, on_result)
+            log.append(f"Saved {count[0] - count[1]} of {len(tasks)} scans into {out}"
+                       + (f"; {count[1]} failed." if count[1] else "."))
+            return log
+
+        def done(log):
+            self.busy = False
+            self.progress.hide()
+            self.report.setPlainText("\n".join(log))
+            self.statusBar().showMessage(log[-1])
+
+        self._run_job(work, done, "Saving all…")
+
     # ---- menus, options, about -------------------------------------------
     def _title(self, name: str | None = None) -> str:
         t = f"{APP_NAME} {__version__}"
@@ -1301,6 +1643,8 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addAction(self.act_save)
         m.addAction(self.act_batch)
+        m.addAction(self.act_process_all)
+        m.addAction(self.act_save_all)
         m.addSeparator()
         m.addAction(self.act_load_settings)
         m.addAction(self.act_save_settings)
@@ -1459,6 +1803,12 @@ def app_icon():
     return icon
 
 
+class _ProcessBridge(QObject):
+    """Carries Process all's results from its thread to the window."""
+    file_done = Signal(object)
+    finished = Signal()
+
+
 class _ErrorBridge(QObject):
     """Carries 'an error report was written' from any thread to the window."""
     error = Signal(str)
@@ -1492,4 +1842,8 @@ def run_gui(paths=None) -> int:
     try:
         return app.exec()
     finally:
+        if win._proc_stop is not None:
+            win._proc_stop.set()
+        win._spiller.shutdown(wait=False, cancel_futures=True)
+        win.scratch.close()
         _crash.clean_exit()

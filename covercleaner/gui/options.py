@@ -135,6 +135,24 @@ class OptionsDialog(QDialog):
         self.updates.setToolTip("Asks GitHub for the latest release; nothing else is sent. "
                                 "Help > About can always check by hand.")
         f.addRow("Updates", self.updates)
+        row = QHBoxLayout()
+        from ..scratch import base_dir
+        self.scratch = QLineEdit(self._s.scratch_dir)
+        self.scratch.setPlaceholderText(base_dir(""))
+        self.scratch.setToolTip("While Cover Cleaner is open, the results of the scans in the "
+                                "list are kept here (about 50-100 MB per scan) so going back "
+                                "to a scan, or Save all, needs no processing again. Emptied "
+                                "when Cover Cleaner closes. Pick a drive with free space.")
+        b = QPushButton("Browse…")
+        b.clicked.connect(self._browse_scratch)
+        d = QPushButton("Default")
+        d.clicked.connect(lambda: self.scratch.setText(""))
+        row.addWidget(self.scratch, 1)
+        row.addWidget(b)
+        row.addWidget(d)
+        f.addRow("Scratch folder", row)
+        f.addRow("", _note("Holds the results of the scans in the list while you work "
+                           "(about 50-100 MB each); emptied on exit. Used from the next start."))
 
         # ---- Auto --------------------------------------------------------
         f = _form(tabs, "Auto")
@@ -209,8 +227,15 @@ class OptionsDialog(QDialog):
         if d:
             self.save_dir.setText(d)
 
+    def _browse_scratch(self):
+        d = QFileDialog.getExistingDirectory(self, "Scratch folder",
+                                             self.scratch.text() or os.getcwd())
+        if d:
+            self.scratch.setText(d)
+
     def _defaults(self):
         d = AppSettings()
+        self.scratch.setText(d.scratch_dir)
         self.save_dir.setText(d.save_dir)
         self.format.setCurrentIndex(("png", "tif", "jpg").index(d.format))
         self.bits.setCurrentIndex(1 if d.bits == 16 else 0)
@@ -245,6 +270,7 @@ class OptionsDialog(QDialog):
         s.fallback_dpi = float(self.dpi.value())
         s.check_updates = self.updates.isChecked()
         s.skip_version = self._s.skip_version
+        s.scratch_dir = self.scratch.text().strip()
         s.flat_cleaner = self.flat.isChecked()
         s.rules = AutoRules(standard_size=self.r_size.isChecked(),
                             white_border=self.r_white.isChecked(),

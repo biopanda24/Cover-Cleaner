@@ -282,6 +282,10 @@ where a mistake would damage the picture:
 ## Manual control
 
 * **Original + outline** view: drag the four green corners.
+* **✂ Drag to crop**: drag a box on the result around what to keep (it sets
+  the trim; painted repairs move with it). *Reset trim* goes back to Auto's
+  crop. The trim boxes always mean the sides as you see them, also after
+  *Rotate left/right*.
 * Every fix has an on/off box and sliders; changes re-render from the first
   affected stage only.
 * **Heal / Protect / Eraser** brushes paint repairs or exclusions directly on
@@ -290,9 +294,28 @@ where a mistake would damage the picture:
 * Hold **Space** (or *Hold: before*) to compare with the unprocessed crop.
 * Settings can be saved as JSON and re-applied from the command line.
 * Switching between scans in the list keeps each one's settings, edits,
-  painted repairs and analysis for the session: going back skips Auto, and
-  for the last few scans (as memory allows) shows the finished result at
-  once. *Auto* re-analyses a scan from scratch.
+  painted repairs, analysis and finished result for the session, however
+  many scans are open: going back shows it at once (results are kept in the
+  scratch folder, see below). *Auto* re-analyses a scan from scratch.
+
+## Working through a list
+
+1. Open the scans (a folder, or drag them in).
+2. **Process all** runs Auto on every scan in the background, several at a
+   time, without saving anything. Scans whose result is ready get a ✓ in
+   the list. You can keep working meanwhile; *Stop processing* stops it.
+3. Go down the list and fine-tune whatever needs it.
+4. **Save all…** saves every scan as it is now: ready results as they are,
+   edited scans with your changes, scans not processed yet after Auto.
+
+*Auto-restore all…* is the one-step alternative: Auto on every scan and
+save, without the review in between.
+
+While Cover Cleaner is open, the results of the scans in the list are kept
+in a **scratch folder** (about 50-100 MB per scan), so going back to any scan
+or *Save all* never processes it again. It is emptied when the program
+closes. It is in the system's temporary folder unless you pick another one
+in *Options > Processing > Scratch folder*, e.g. on a drive with more space.
 
 ## Layout
 

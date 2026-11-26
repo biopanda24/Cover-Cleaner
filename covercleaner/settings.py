@@ -45,6 +45,7 @@ class AppSettings:
     # updates
     check_updates: bool = True    # look for a new version when the program starts
     skip_version: str = ""        # a version the user chose to skip
+    scratch_dir: str = ""         # results of open scans while editing; "" = system temp
 
     # ---- helpers ---------------------------------------------------------
     def mode(self, ml_available: bool) -> str:

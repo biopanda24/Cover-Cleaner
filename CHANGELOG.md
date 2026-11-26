@@ -3,6 +3,30 @@
 Version numbers follow semantic versioning: the minor number goes up for
 new features, the patch number for fixes.
 
+## 0.8.0 - 2026-11-26
+
+Working through a list:
+
+- **Process all** runs Auto on every scan in the list in the background
+  (several at a time) without saving, so you can go down the list and
+  fine-tune; ✓ marks scans that are ready. **Save all…** then saves every
+  scan as it is now - with your edits - rendering edited scans from your
+  settings and running Auto only on scans never processed.
+- Every scan in the list now keeps its finished result for the session, not
+  only the last four: results are kept in a scratch folder (16-bit, exact),
+  so going back to any scan is immediate instead of rendering it again
+  (which looked like Auto running again). Folder: system temp by default,
+  *Options > Processing > Scratch folder* to change; emptied on exit.
+
+Cropping:
+
+- **✂ Drag to crop**: drag a box on the result to keep just that part. It
+  sets the trim, and painted repairs and staple fills move with it. *Reset
+  trim* goes back to Auto's crop. Trim boxes accept up to 20 000 px.
+- The trim boxes now follow *Rotate left/right*: "bottom" is always the
+  side at the bottom as you see it (before, after a quarter turn it cropped
+  a side edge).
+
 ## 0.7.1 - 2026-11-13
 
 - Fixed a crash with GPU (CUDA) inpainting: opening a folder, letting a

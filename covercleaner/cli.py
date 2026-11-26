@@ -113,6 +113,106 @@ def _auto_one(path: str, dst: str | None, opts: dict) -> tuple[str, bool]:
         return "\n".join(lines), False
 
 
+# ---- editor: process the whole list without saving, then save it all ----------
+def process_one(path: str, result_file: str, opts: dict) -> dict:
+    """Auto on one scan; the result goes to `result_file` (scratch), not saved."""
+    from . import scratch
+    from . import settings as _settings
+    t0 = time.time()
+    st = _settings.AppSettings.from_dict(opts["settings"])
+    ml.set_use_gpu(st.use_gpu)
+    try:
+        src = load_image(path)
+        pipe = Pipeline(src)
+        params, report = auto_params(src, pipeline=pipe, mode=opts.get("mode") or st.mode(ml.available()),
+                                     dpi=st.dpi_for(read_dpi(path)), flat_cleaner=st.flat_cleaner,
+                                     rules=st.rules, scale=st.scale)
+        scratch.save_result(result_file, pipe.run(params))
+        return dict(path=path, ok=True, params=params.to_json(), report=list(report),
+                    result_file=result_file, seconds=time.time() - t0)
+    except Exception as exc:
+        return dict(path=path, ok=False, error=f"{type(exc).__name__}: {exc}")
+
+
+def save_one(path: str, dst: str, opts: dict, job: dict) -> tuple[str, bool]:
+    """Save one scan as it is in the editor: its result from the scratch folder,
+    or its settings (and painted masks) rendered, or - never processed - Auto."""
+    from . import scratch
+    from . import settings as _settings
+    from .params import Params
+    if not job.get("result_file") and not job.get("params"):
+        return _auto_one(path, dst, opts)
+    st = _settings.AppSettings.from_dict(opts["settings"])
+    ml.set_use_gpu(st.use_gpu)
+    t0 = time.time()
+    try:
+        params = Params.from_json(job["params"]) if job.get("params") else None
+        if job.get("result_file"):
+            result, how = scratch.load_result(job["result_file"]), "as edited"
+        else:
+            pipe = Pipeline(load_image(path))
+            masks = job.get("masks")
+            if masks:
+                import cv2
+                import numpy as np
+                pipe.heal_mask = cv2.imdecode(np.frombuffer(masks[0], np.uint8), cv2.IMREAD_UNCHANGED)
+                pipe.protect_mask = cv2.imdecode(np.frombuffer(masks[1], np.uint8), cv2.IMREAD_UNCHANGED)
+                pipe.masks_changed()
+            result, how = pipe.run(params), "rendered from your settings"
+        save_image(dst, result, st.bits, st.jpeg_quality)
+        if st.save_params and params is not None:
+            with open(os.path.splitext(dst)[0] + ".json", "w", encoding="utf8") as fh:
+                fh.write(params.to_json())
+        return (f"== {path}\n   -> {dst}  ({result.shape[1]} x {result.shape[0]}, {how}, "
+                f"{time.time() - t0:.1f}s)"), True
+    except Exception as exc:
+        return f"== {path}\n   FAILED: {exc}", False
+
+
+def run_pool(fn, tasks: list[tuple], jobs: int, on_result, stop=None) -> None:
+    """Run fn(*task) for each task, `jobs` at a time in worker processes, and
+    call on_result(task, result) as each finishes (in the calling thread).
+    `stop` (a threading.Event) cancels what has not started. A task whose
+    worker died is retried in this process."""
+    from concurrent.futures.process import BrokenProcessPool
+    if not tasks:
+        return
+    jobs = max(1, min(jobs, len(tasks)))
+    retry = []
+    if jobs == 1:
+        for t in tasks:
+            if stop is not None and stop.is_set():
+                return
+            on_result(t, fn(*t))
+        return
+    threads = max(1, (os.cpu_count() or 1) // jobs)
+    with ProcessPoolExecutor(jobs, initializer=_worker_init, initargs=(threads,)) as ex:
+        futures = {ex.submit(fn, *t): t for t in tasks}
+        pending = set(futures)
+        while pending:
+            if stop is not None and stop.is_set():
+                for f in pending:
+                    f.cancel()
+                ex.shutdown(wait=True, cancel_futures=True)
+                return
+            done = [f for f in pending if f.done()]
+            if not done:
+                time.sleep(0.1)
+                continue
+            for f in done:
+                pending.discard(f)
+                try:
+                    on_result(futures[f], f.result())
+                except BrokenProcessPool:
+                    retry.append(futures[f])
+                except Exception as exc:
+                    on_result(futures[f], exc)
+    for t in retry:
+        if stop is not None and stop.is_set():
+            return
+        on_result(t, fn(*t))
+
+
 def plan_outputs(files: list[str], st, output: str | None = None,
                  output_is_dir: bool = False) -> dict:
     """Output file for each scan, all different and none over an original.
